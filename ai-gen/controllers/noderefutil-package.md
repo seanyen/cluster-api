@@ -17,20 +17,20 @@ func IsNodeAvailable(node *corev1.Node, minReadySeconds int32, now metav1.Time) 
 **Logic:**
 1. Returns `false` if node is not ready (`IsNodeReady()` returns false)
 2. Returns `true` immediately if `minReadySeconds == 0`
-3. Otherwise, checks if `LastTransitionTime + minReadySeconds < now`
+3. Otherwise, checks if `LastTransitionTime + minReadySeconds < now.Time` (using `time.Duration(minReadySeconds) * time.Second`)
 
 **Logic Flow:**
 
 ```mermaid
 flowchart TD
-    Start[IsNodeAvailable] --> CheckReady{IsNodeReady?}
-    CheckReady -->|No| ReturnFalse[Return false]
-    CheckReady -->|Yes| CheckMinReady{minReadySeconds == 0?}
+    Start[IsNodeAvailable] --> CheckReady{IsNodeReady&#40;node&#41;?}
+    CheckReady -->|false| ReturnFalse[Return false]
+    CheckReady -->|true| CheckMinReady{minReadySeconds == 0?}
     
     CheckMinReady -->|Yes| ReturnTrue[Return true]
-    CheckMinReady -->|No| GetCondition[Get Ready Condition]
+    CheckMinReady -->|No| GetCondition[GetReadyCondition&#40;&node.Status&#41;]
     
-    GetCondition --> CheckTransition{LastTransitionTime +<br/>minReadySeconds < now?}
+    GetCondition --> CheckTransition{!LastTransitionTime.IsZero&#40;&#41;<br/>AND<br/>LastTransitionTime.Add&#40;duration&#41;.Before&#40;now.Time&#41;?}
     CheckTransition -->|Yes| ReturnTrue
     CheckTransition -->|No| ReturnFalse
     
@@ -96,9 +96,11 @@ Extracts the Ready condition from a node's status.
 func GetReadyCondition(status *corev1.NodeStatus) *corev1.NodeCondition
 ```
 
-**Returns**: `*corev1.NodeCondition` for the `NodeReady` type, or `nil` if:
+**Returns**: `*corev1.NodeCondition` for the `corev1.NodeReady` type, or `nil` if:
 - `status` is `nil`
-- No condition with type `NodeReady` exists
+- No condition with type `NodeReady` exists in `status.Conditions`
+
+**Implementation**: Iterates through `status.Conditions` and returns a pointer to the condition where `Type == corev1.NodeReady`.
 
 ## Node States
 
@@ -142,26 +144,27 @@ stateDiagram-v2
 
 | Observed Status | Input | Function | Result | Use Case |
 |:----------------|:------|:---------|:-------|:---------|
-| `Ready=True` | valid node | `IsNodeReady()` | `true` | Check if node can accept workloads |
-| `Ready=False` | valid node | `IsNodeReady()` | `false` | Node has reported problems |
-| `Ready=Unknown` | valid node | `IsNodeReady()` | `false` | Node is unreachable (kubelet not reporting) |
+| `Ready=True` (`corev1.ConditionTrue`) | valid node | `IsNodeReady()` | `true` | Check if node can accept workloads |
+| `Ready=False` (`corev1.ConditionFalse`) | valid node | `IsNodeReady()` | `false` | Node has reported problems |
+| `Ready=Unknown` (`corev1.ConditionUnknown`) | valid node | `IsNodeReady()` | `false` | Node is unreachable (kubelet not reporting) |
 | No Ready condition | valid node | `IsNodeReady()` | `false` | Node hasn't reported status yet |
 | N/A | `node=nil` | `IsNodeReady()` | `false` | Node doesn't exist |
 | `Ready=Unknown` | valid node | `IsNodeUnreachable()` | `true` | Node lost contact with control plane |
 | `Ready=True` | valid node | `IsNodeUnreachable()` | `false` | Node is reachable and healthy |
 | `Ready=False` | valid node | `IsNodeUnreachable()` | `false` | Node reachable but unhealthy |
-| No Ready condition | valid node | `IsNodeUnreachable()` | `false` | Cannot determine unreachability |
+| No Ready condition | valid node | `IsNodeUnreachable()` | `false` | Cannot determine unreachability (no condition to check) |
+| N/A | `node=nil` | `IsNodeUnreachable()` | `false` | Node doesn't exist |
 
 ### Node Availability Evaluation
 
 | Observed Status | minReadySeconds | Elapsed Since LastTransitionTime | Result |
 |:----------------|:----------------|:--------------------------------|:-------|
-| `Ready=False` | Any | Any | `false` |
-| `Ready=True` | 0 | Any | `true` |
-| `Ready=True` | 30 | < 30s | `false` |
-| `Ready=True` | 30 | >= 30s | `true` |
-| `Ready=Unknown` | Any | Any | `false` |
-| `Ready=True`, `LastTransitionTime` is zero | > 0 | N/A | `false` (safety check) |
+| `Ready=False` | Any | Any | `false` (fails IsNodeReady check) |
+| `Ready=True` | 0 | Any | `true` (minReadySeconds bypass) |
+| `Ready=True` | 30 | < 30s | `false` (not yet stable) |
+| `Ready=True` | 30 | >= 30s | `true` (stable and ready) |
+| `Ready=Unknown` | Any | Any | `false` (fails IsNodeReady check) |
+| `Ready=True`, `LastTransitionTime.IsZero()=true` | > 0 | N/A | `false` (safety check - zero time fails Before comparison) |
 
 ## Usage Examples
 
@@ -249,14 +252,16 @@ flowchart TB
 
 ## Important Notes
 
-1. **Nil Safety**: All functions safely handle `nil` node inputs by returning `false`
+1. **Nil Safety**: All functions safely handle `nil` node inputs by returning `false` as the first check
 
-2. **Condition Iteration**: Functions iterate through all conditions to find the `NodeReady` type
+2. **Condition Iteration**: Functions iterate through `node.Status.Conditions` to find the `corev1.NodeReady` type
 
-3. **MinReadySeconds**: The availability check considers `LastTransitionTime`, not when the node was created
+3. **MinReadySeconds**: The availability check uses `LastTransitionTime.Add(time.Duration(minReadySeconds) * time.Second).Before(now.Time)`, not when the node was created
 
 4. **Unknown vs False**: 
-   - `Ready=Unknown` indicates network/communication issues (unreachable)
-   - `Ready=False` indicates the kubelet detected problems (not ready but reachable)
+   - `Ready=Unknown` (`corev1.ConditionUnknown`) indicates network/communication issues (unreachable)
+   - `Ready=False` (`corev1.ConditionFalse`) indicates the kubelet detected problems (not ready but reachable)
 
 5. **Thread Safety**: These are pure utility functions with no state - safe for concurrent use
+
+6. **GetReadyCondition Returns Pointer**: Returns a pointer to the actual condition in the slice, allowing callers to access `LastTransitionTime` and other fields

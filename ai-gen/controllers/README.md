@@ -58,21 +58,21 @@ flowchart TB
 
 The `alias.go` file provides public types that wrap internal reconciler implementations:
 
-| Reconciler | Resource | Description |
-|------------|----------|-------------|
-| `ClusterReconciler` | Cluster | Reconciles Cluster objects, manages remote connection grace period |
-| `MachineReconciler` | Machine | Reconciles Machine objects, syncs labels/annotations, uses RuntimeClient |
-| `MachineSetReconciler` | MachineSet | Reconciles MachineSet objects, supports preflight checks |
-| `MachineDeploymentReconciler` | MachineDeployment | Reconciles MachineDeployment objects |
-| `MachineHealthCheckReconciler` | MachineHealthCheck | Reconciles MachineHealthCheck objects |
-| `ClusterTopologyReconciler` | Cluster (topology) | Reconciles managed topology for Clusters |
-| `MachineDeploymentTopologyReconciler` | MachineDeployment | Handles topology-owned MachineDeployment deletion and template cleanup |
-| `MachineSetTopologyReconciler` | MachineSet | Handles topology-owned MachineSet deletion and template cleanup |
-| `ClusterClassReconciler` | ClusterClass | Reconciles ClusterClass objects, exposes `Reconcile()` for testing |
-| `ClusterResourceSetReconciler` | ClusterResourceSet | Reconciles ClusterResourceSet objects, requires `partialSecretCache` |
-| `ClusterResourceSetBindingReconciler` | ClusterResourceSetBinding | Reconciles ClusterResourceSetBinding objects |
-| `MachinePoolReconciler` | MachinePool | Reconciles MachinePool objects |
-| `ExtensionConfigReconciler` | ExtensionConfig | Reconciles ExtensionConfig objects, supports read-only mode |
+| Reconciler | Resource | Key Fields | Description |
+|------------|----------|------------|-------------|
+| `ClusterReconciler` | Cluster | Client, APIReader, ClusterCache, WatchFilterValue, RemoteConnectionGracePeriod | Reconciles Cluster objects |
+| `MachineReconciler` | Machine | Client, APIReader, ClusterCache, RuntimeClient, WatchFilterValue, RemoteConditionsGracePeriod, AdditionalSyncMachineLabels, AdditionalSyncMachineAnnotations | Reconciles Machine objects, syncs labels/annotations |
+| `MachineSetReconciler` | MachineSet | Client, APIReader, ClusterCache, PreflightChecks, WatchFilterValue | Reconciles MachineSet objects, supports preflight checks |
+| `MachineDeploymentReconciler` | MachineDeployment | Client, APIReader, RuntimeClient, WatchFilterValue | Reconciles MachineDeployment objects |
+| `MachineHealthCheckReconciler` | MachineHealthCheck | Client, ClusterCache, WatchFilterValue | Reconciles MachineHealthCheck objects |
+| `ClusterTopologyReconciler` | Cluster (topology) | Client, ClusterCache, APIReader, RuntimeClient, WatchFilterValue | Reconciles managed topology for Clusters |
+| `MachineDeploymentTopologyReconciler` | MachineDeployment | Client, APIReader, WatchFilterValue | Handles topology-owned MachineDeployment deletion and template cleanup |
+| `MachineSetTopologyReconciler` | MachineSet | Client, APIReader, WatchFilterValue | Handles topology-owned MachineSet deletion and template cleanup |
+| `ClusterClassReconciler` | ClusterClass | Client, RuntimeClient, WatchFilterValue | Reconciles ClusterClass objects, exposes `Reconcile()` for testing |
+| `ClusterResourceSetReconciler` | ClusterResourceSet | Client, ClusterCache, WatchFilterValue | Reconciles ClusterResourceSet objects. SetupWithManager requires `partialSecretCache` parameter. |
+| `ClusterResourceSetBindingReconciler` | ClusterResourceSetBinding | Client, WatchFilterValue | Reconciles ClusterResourceSetBinding objects |
+| `MachinePoolReconciler` | MachinePool | Client, APIReader, ClusterCache, WatchFilterValue | Reconciles MachinePool objects |
+| `ExtensionConfigReconciler` | ExtensionConfig | Client, APIReader, RuntimeClient, PartialSecretCache, ReadOnly, WatchFilterValue | Reconciles ExtensionConfig objects, supports read-only mode |
 
 ### Common Reconciler Fields
 
@@ -86,6 +86,7 @@ type CommonReconcilerFields struct {
     
     // APIReader is a live (non-cached) client for critical reads
     // (avoids race conditions from stale cache)
+    // Used to list resources directly via the API server
     APIReader client.Reader
     
     // ClusterCache provides cached connections to workload clusters
@@ -97,6 +98,7 @@ type CommonReconcilerFields struct {
     RuntimeClient runtimeclient.Client
     
     // WatchFilterValue filters resources by label before reconciliation
+    // Used with predicates.ResourceHasFilterLabel
     WatchFilterValue string
 }
 ```
@@ -200,6 +202,35 @@ func (r *ReconcilerType) SetupWithManager(ctx context.Context, mgr ctrl.Manager,
 }
 ```
 
+### Special Setup Notes
+
+| Reconciler | Special Setup Requirements |
+|------------|---------------------------|
+| `ClusterResourceSetReconciler` | `SetupWithManager()` requires an additional `partialSecretCache cache.Cache` parameter for partial secret caching |
+| `ClusterClassReconciler` | Exposes `Reconcile(ctx, req)` method for testing ClusterClass reconciliation directly |
+| `ExtensionConfigReconciler` | Supports `ReadOnly` mode and requires `PartialSecretCache` for extension secrets |
+
+## Reconciler Kubernetes Reconciler Transition Table (KRTT) Overview
+
+Since the main reconciler logic lives in `internal/controllers/`, the KRTT tables for each reconciler should be documented in those internal packages. The alias types in this package only delegate to internal implementations.
+
+### Common Reconciler Patterns
+
+| Pattern | Description | Example Reconcilers |
+|---------|-------------|---------------------|
+| **Cluster-scoped with ClusterCache** | Reconcilers that interact with workload clusters | `ClusterReconciler`, `MachineReconciler`, `MachineHealthCheckReconciler` |
+| **Topology-aware** | Reconcilers that manage cluster topology and template cleanup | `ClusterTopologyReconciler`, `MachineDeploymentTopologyReconciler`, `MachineSetTopologyReconciler` |
+| **Resource Management** | Reconcilers that manage Kubernetes resources on workload clusters | `ClusterResourceSetReconciler`, `ClusterResourceSetBindingReconciler` |
+| **Runtime Extensions** | Reconcilers that interact with runtime extensions | `ExtensionConfigReconciler`, `ClusterClassReconciler` |
+
+### KRTT for Alias Reconciler Setup
+
+| Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
+|:----------------|:-------------|:--------------------|:----------------------|:-----------------|
+| Controller not set up | Reconciler configured | `SetupWithManager()` called | Create internal reconciler, delegate `SetupWithManager()` | Controller registered with manager |
+| Missing required fields | Reconciler configured | `SetupWithManager()` called with nil fields | Return error or panic (depends on internal implementation) | Setup failed |
+| Manager starting | Reconciler set up | Manager `Start()` called | Internal reconciler begins watching resources | Reconciler running |
+
 ## Usage Example
 
 ```go
@@ -207,6 +238,7 @@ package main
 
 import (
     "context"
+    "time"
     
     ctrl "sigs.k8s.io/controller-runtime"
     "sigs.k8s.io/controller-runtime/pkg/controller"
@@ -260,7 +292,7 @@ func main() {
 
 | Document | Description | Key KRTT Tables |
 |----------|-------------|-----------------|
-| [clustercache-controller.md](clustercache-controller.md) | ClusterCache controller and workload cluster connection management | Reconcile, Connect/Disconnect, Health Checking |
+| [clustercache-controller.md](clustercache-controller.md) | ClusterCache controller and workload cluster connection management | Reconcile, Connect/Disconnect, Health Checking, Watch Management |
 | [crdmigrator-controller.md](crdmigrator-controller.md) | CRD migration controller for storage version and managedFields | Main Reconcile, Storage Version Migration, ManagedFields Cleanup |
 | [external-package.md](external-package.md) | External object utilities for provider resources | ObjectTracker Watch, External Object Operations |
 | [remote-package.md](remote-package.md) | Remote cluster client creation utilities | NewClusterClient, RESTConfig |

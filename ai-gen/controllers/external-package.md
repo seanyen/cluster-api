@@ -53,6 +53,8 @@ The `ObjectTracker` is a helper for dynamically adding watches on external unstr
 
 ```go
 type ObjectTracker struct {
+    m sync.Map  // internal map for tracking watched GroupKinds
+
     Controller      controller.Controller  // Required: The controller to add watches to
     Cache           cache.Cache            // Required: Cache for creating informers
     Scheme          *runtime.Scheme        // Required: Scheme for predicate filtering
@@ -60,9 +62,9 @@ type ObjectTracker struct {
 }
 ```
 
-**Important**: All four fields must be set before calling `Watch()`, otherwise an error is returned.
+**Important**: All four exported fields must be set before calling `Watch()`, otherwise an error is returned: `"all of Controller, Cache, Scheme and PredicateLogger must be set for object tracker"`.
 
-**Purpose**: Ensures each external object type is watched only once per GroupKind, even if multiple resources reference it with different versions.
+**Purpose**: Ensures each external object type is watched only once per GroupKind (using `gvk.GroupKind().String()` as key), even if multiple resources reference it with different versions.
 
 ```mermaid
 sequenceDiagram
@@ -90,13 +92,13 @@ sequenceDiagram
 
 | Function | Description | Returns |
 |----------|-------------|--------|
-| `Get` | Fetches an external unstructured object by `*corev1.ObjectReference` | `(*unstructured.Unstructured, error)` |
-| `GetObjectFromContractVersionedRef` | Fetches object using `ContractVersionedObjectReference` with automatic version discovery via CRD contract | `(*unstructured.Unstructured, error)` |
-| `Delete` | Deletes an external unstructured object by `*corev1.ObjectReference` | `error` |
-| `CreateFromTemplate` | Creates a new object from a template (calls `GenerateTemplate` + `client.Create`) | `(*unstructured.Unstructured, ContractVersionedObjectReference, error)` |
-| `GenerateTemplate` | Generates an unstructured object from a template's `spec.template` field | `(*unstructured.Unstructured, error)` |
-| `FailuresFrom` | Extracts `status.failureReason` and `status.failureMessage` from object | `(string, string, error)` |
-| `IsReady` | Checks if `status.ready` is `true` | `(bool, error)` |
+| `Get(ctx, c, ref)` | Fetches an external unstructured object by `*corev1.ObjectReference` | `(*unstructured.Unstructured, error)` |
+| `GetObjectFromContractVersionedRef(ctx, c, ref, namespace)` | Fetches object using `ContractVersionedObjectReference` with automatic version discovery via CRD contract | `(*unstructured.Unstructured, error)` |
+| `Delete(ctx, c, ref)` | Deletes an external unstructured object by `*corev1.ObjectReference` | `error` |
+| `CreateFromTemplate(ctx, in)` | Creates a new object from a template (calls `GenerateTemplate` + `client.Create`) | `(*unstructured.Unstructured, ContractVersionedObjectReference, error)` |
+| `GenerateTemplate(in)` | Generates an unstructured object from a template's `spec.template` field (tolerates missing template) | `(*unstructured.Unstructured, error)` |
+| `FailuresFrom(obj)` | Extracts `status.failureReason` and `status.failureMessage` from object | `(string, string, error)` |
+| `IsReady(obj)` | Checks if `status.ready` is `true` AND exists | `(bool, error)` |
 
 ## Template Cloning Process
 
@@ -132,15 +134,26 @@ When cloning from a template, these annotations are automatically added:
 
 | Annotation | Value |
 |------------|-------|
-| `cluster.x-k8s.io/cloned-from-name` | Original template name |
-| `cluster.x-k8s.io/cloned-from-groupkind` | Template's GroupKind |
+| `cluster.x-k8s.io/cloned-from-name` | Original template name (`TemplateClonedFromNameAnnotation`) |
+| `cluster.x-k8s.io/cloned-from-groupkind` | Template's GroupKind string (`TemplateClonedFromGroupKindAnnotation`) |
 
 ### Template Labels
 
 | Label | Value |
 |-------|-------|
-| `cluster.x-k8s.io/cluster-name` | Owning cluster name |
-| Custom labels | Passed via `Labels` parameter |
+| `cluster.x-k8s.io/cluster-name` | Owning cluster name (`ClusterNameLabel`) |
+| Custom labels | Passed via `Labels` parameter in input |
+
+### Generated Object Properties
+
+| Property | Behavior |
+|----------|----------|
+| Name | Uses `in.Name` if set, otherwise generates via `names.SimpleNameGenerator.GenerateName(template.Name + "-")` |
+| Namespace | Set to `in.Namespace` |
+| APIVersion | Inherits from template if not set in `spec.template` |
+| Kind | Inherits from template, with "Template" suffix stripped (`strings.TrimSuffix(kind, TemplateSuffix)`) |
+| OwnerReferences | Set to `[*in.OwnerRef]` if provided |
+| ResourceVersion, UID, SelfLink, Finalizers | Cleared (set to empty/nil) |
 
 ## Contract-Versioned Reference Handling
 
@@ -171,19 +184,22 @@ sequenceDiagram
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| Tracker fields not all set | Watch requested | `Watch()` called | Return error "all of Controller, Cache, Scheme and PredicateLogger must be set" | Error returned |
-| GroupKind not tracked | Watch requested | First `Watch()` call for GroupKind | `sync.Map.LoadOrStore()` stores key, `Controller.Watch()` creates informer with `ResourceNotPaused` predicate | GroupKind tracked, informer running |
-| GroupKind already tracked | Watch requested | Subsequent `Watch()` for same GroupKind | `LoadOrStore()` returns early (no-op) | No change |
-| Watch creation failed | Watch requested | `Controller.Watch()` returns error | Delete key from sync.Map, return wrapped error | GroupKind not tracked, error returned |
+| Tracker fields not all set | Watch requested | `Watch()` called with nil Controller/Cache/Scheme/PredicateLogger | Return error "all of Controller, Cache, Scheme and PredicateLogger must be set for object tracker" | Error returned |
+| GroupKind not tracked | Watch requested | First `Watch()` call for GroupKind | `sync.Map.LoadOrStore(gvk.GroupKind().String(), struct{}{})` stores key, `Controller.Watch(source.Kind(...))` creates informer with `ResourceNotPaused` predicate appended | GroupKind tracked, informer running |
+| GroupKind already tracked | Watch requested | Subsequent `Watch()` for same GroupKind | `LoadOrStore()` returns `loaded=true`, return nil early | No change (idempotent) |
+| Watch creation failed | Watch requested | `Controller.Watch()` returns error | `m.Delete(key)` removes from map, return wrapped error | GroupKind not tracked, error returned |
 
 ### External Object Operations
 
 | Operation | Trigger / Condition | Action | Result on Success | Result on Error |
 |:----------|:--------------------|:-------|:------------------|:----------------|
-| `Get` | ObjectReference provided | Fetch via client.Get | Return *Unstructured | Wrapped error |
-| `GetObjectFromContractVersionedRef` | ContractVersionedRef provided | Discover version, then fetch | Return *Unstructured | Wrapped error |
-| `Delete` | ObjectReference provided | Delete via client.Delete | nil | Wrapped error |
-| `CreateFromTemplate` | Template + config provided | Clone template, create object | Return object + ref | Wrapped error |
+| `Get(ctx, c, ref)` | ObjectReference provided, `ref != nil` | Create Unstructured with GVK/Name/Namespace from ref, call `c.Get()` | Return `*Unstructured` | Wrapped error: "failed to retrieve {Kind} {namespace/name}" |
+| `Get(ctx, c, nil)` | ObjectReference is nil | Return immediately | N/A | Error: "cannot get object - object reference not set" |
+| `GetObjectFromContractVersionedRef(ctx, c, ref, ns)` | ContractVersionedRef provided, `ref.IsDefined()=true` | Discover API version via `contract.GetGKMetadata` + `GetLatestContractAndAPIVersionFromContract`, then `c.Get()` | Return `*Unstructured` | Wrapped error or generic error if CRD not found |
+| `GetObjectFromContractVersionedRef(ctx, c, ref, ns)` | `!ref.IsDefined()` | Return immediately | N/A | Error: "cannot get object - object reference not set" |
+| `Delete(ctx, c, ref)` | ObjectReference provided | Create Unstructured with GVK/Name/Namespace, call `c.Delete()` | nil | Wrapped error: "failed to delete {Kind} {namespace/name}" |
+| `CreateFromTemplate(ctx, in)` | Template + config provided | `Get()` template, `GenerateTemplate()`, `client.Create()` | Return `(*Unstructured, ContractVersionedObjectReference)` | Wrapped error from any step |
+| `GenerateTemplate(in)` | Template input provided | Extract `spec.template` (tolerates not found), apply metadata transformations | Return `*Unstructured` | Wrapped error if extraction fails |
 
 ### ReconcileOutput
 
@@ -322,8 +338,12 @@ flowchart LR
 
 1. **Unstructured Objects**: All external objects are handled as `*unstructured.Unstructured` to avoid compile-time dependencies on provider types
 
-2. **Template Suffix Stripping**: When generating from templates, the "Template" suffix is automatically stripped from the Kind (e.g., `AWSMachineTemplate` → `AWSMachine`)
+2. **Template Suffix Stripping**: When generating from templates, the "Template" suffix is automatically stripped from the Kind (e.g., `AWSMachineTemplate` → `AWSMachine`) using `strings.TrimSuffix(kind, clusterv1.TemplateSuffix)`
 
-3. **Predicate Filtering**: The ObjectTracker automatically adds `ResourceNotPaused` predicate to all watches
+3. **Predicate Filtering**: The ObjectTracker automatically appends `predicates.ResourceNotPaused(o.Scheme, *o.PredicateLogger)` predicate to all watches
 
-4. **Error Wrapping**: All errors are wrapped with context about the operation and object being processed
+4. **Error Wrapping**: All errors are wrapped with context about the operation and object being processed using `errors.Wrapf`
+
+5. **Contract Version Discovery**: `GetObjectFromContractVersionedRef` uses `contract.GetGKMetadata` and `contract.GetLatestContractAndAPIVersionFromContract` to automatically discover the correct API version
+
+6. **Template Tolerance**: `GenerateTemplate` tolerates templates without `spec.template` field by using an empty template as replacement

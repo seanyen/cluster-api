@@ -55,14 +55,14 @@ The `ClusterCache` interface provides methods for:
 
 | Method | Description |
 |--------|-------------|
-| `GetClient()` | Returns a cached client for a workload cluster |
-| `GetReader()` | Returns a cached read-only client |
-| `GetUncachedClient()` | Returns a live (uncached) client |
-| `GetRESTConfig()` | Returns REST configuration for a cluster |
-| `GetClientCertificatePrivateKey()` | ⚠️ **Deprecated** - Returns a cached RSA private key for client certificates (will be removed) |
-| `Watch()` | Establishes watches on workload cluster resources |
-| `GetHealthCheckingState()` | Returns `HealthCheckingState` with `LastProbeTime`, `LastProbeSuccessTime`, `ConsecutiveFailures` |
-| `GetClusterSource()` | Returns a `source.Source` for Cluster connect/disconnect events |
+| `GetClient(ctx, cluster)` | Returns a cached client for a workload cluster |
+| `GetReader(ctx, cluster)` | Returns a cached read-only client (returns the cachedClient) |
+| `GetUncachedClient(ctx, cluster)` | Returns a live (uncached) client for direct API calls |
+| `GetRESTConfig(ctx, cluster)` | Returns REST configuration for a cluster |
+| `GetClientCertificatePrivateKey(ctx, cluster)` | ⚠️ **Deprecated** - Returns a cached RSA private key for client certificates (will be removed as it's outside scope of ClusterCache) |
+| `Watch(ctx, cluster, watcher)` | Establishes watches on workload cluster resources. Each unique watch (by `watcher.Name()`) is only added once after Connect |
+| `GetHealthCheckingState(ctx, cluster)` | Returns `HealthCheckingState` with `LastProbeTime`, `LastProbeSuccessTime`, `ConsecutiveFailures` |
+| `GetClusterSource(controllerName, mapFunc, opts...)` | Returns a `source.Source` for Cluster connect/disconnect events. Supports `WatchForProbeFailure(time.Duration)` option |
 
 ### clusterAccessor
 
@@ -78,14 +78,14 @@ Each `clusterAccessor` manages the connection to a single workload cluster:
 stateDiagram-v2
     [*] --> NotConnected: Cluster Created
     
-    NotConnected --> Connecting: Infrastructure Provisioned
-    Connecting --> Connected: Connection Success
-    Connecting --> NotConnected: Connection Failed
+    NotConnected --> Connecting: InfrastructureProvisioned=true
+    Connecting --> Connected: Connect() Success
+    Connecting --> NotConnected: Connect() Failed
     
-    Connected --> HealthChecking: Periodic Probe
+    Connected --> HealthChecking: HealthProbe.Interval elapsed (10s)
     HealthChecking --> Connected: Probe Success
-    HealthChecking --> Disconnecting: Too Many Failures
-    HealthChecking --> Disconnecting: Unauthorized Error
+    HealthChecking --> Disconnecting: consecutiveFailures >= FailureThreshold(5)
+    HealthChecking --> Disconnecting: Unauthorized Error (401)
     
     Disconnecting --> NotConnected: Cache Stopped
     NotConnected --> [*]: Cluster Deleted
@@ -93,10 +93,12 @@ stateDiagram-v2
     note right of Connected
         Client, Cache, REST Config available
         Health probes run every 10s
+        FailureThreshold = 5
     end note
     
     note right of NotConnected
         Retry connection after 30s
+        (ConnectionCreationRetryInterval)
     end note
 ```
 
@@ -107,35 +109,52 @@ stateDiagram-v2
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
 | No clusterAccessor exists | Cluster exists | Cluster object created/updated | `getOrCreateClusterAccessor()` creates entry in map | clusterAccessor created (not connected) |
+| Cluster not found | N/A | `client.Get()` returns NotFound | Call `Disconnect()`, `deleteClusterAccessor()`, `cleanupClusterSourcesForCluster()` | clusterAccessor removed |
 | `Status.Initialization.InfrastructureProvisioned=false` | Cluster exists | Reconcile triggered | Skip connection attempt, no requeue (wait for status update) | No change, wait for infra |
 | Not connected, no recent error | `Status.Initialization.InfrastructureProvisioned=true` | Reconcile triggered | Call `accessor.Connect()` to create client/cache | Connected=true, `lastProbeSuccessTime=now`, `consecutiveFailures=0` |
-| Not connected, recent error | `Status.Initialization.InfrastructureProvisioned=true` | Reconcile within `ConnectionCreationRetryInterval` (30s) | Skip connection, requeue after remaining interval | No change, requeue with remaining duration |
-| Connected | `InfrastructureProvisioned=true` | Health probe interval elapsed | Execute `HealthCheck()` - GET "/" on apiserver | LastProbeTime updated, consecutiveFailures=0 |
-| Connected, probe failed | `InfrastructureProvisioned=true` | Health probe returned error | Increment consecutiveFailures | consecutiveFailures++, requeue for next probe |
-| Connected, `consecutiveFailures >= 5` | `InfrastructureProvisioned=true` | FailureThreshold exceeded | Call `Disconnect()`, stop cache | Connected=false, requeue for reconnect |
-| Connected | `InfrastructureProvisioned=true` | Unauthorized error from probe | Immediate `Disconnect()` (kubeconfig rotated) | Connected=false, immediate requeue |
-| clusterAccessor exists | Cluster deleted | `DeletionTimestamp != nil` | Call `Disconnect()`, delete from map, cleanup sources | clusterAccessor removed |
+| Not connected, recent error | `Status.Initialization.InfrastructureProvisioned=true` | Reconcile within `ConnectionCreationRetryInterval` (30s) | Skip connection via `shouldRequeue()`, requeue after remaining interval | No change, requeue with remaining duration |
+| Connect failed | `InfrastructureProvisioned=true` | `Connect()` returns error | Set `lastConnectionCreationErrorTime=now`, increment consecutiveFailures | connected=false, requeue after 30s |
+| Connected | `InfrastructureProvisioned=true` | Health probe interval (10s) elapsed | Execute `HealthCheck()` - GET "/" on apiserver with 5s timeout | `lastProbeTime` updated |
+| Connected, probe succeeded | `InfrastructureProvisioned=true` | Health probe returned success | Reset failures, update success time | `consecutiveFailures=0`, `lastProbeSuccessTime=now`, requeue after 10s |
+| Connected, probe failed | `InfrastructureProvisioned=true` | Health probe returned non-auth error | Increment consecutiveFailures | `consecutiveFailures++`, requeue for next probe |
+| Connected, `consecutiveFailures >= 5` | `InfrastructureProvisioned=true` | FailureThreshold exceeded | Call `Disconnect()`, stop cache | Connected=false, requeue after 30s (ConnectionCreationRetryInterval) |
+| Connected | `InfrastructureProvisioned=true` | Unauthorized (401) error from probe | Immediate `Disconnect()` (kubeconfig rotated) | Connected=false, immediate requeue (1ms) |
+| Reconcile complete | N/A | After all phases | `sendEventsToClusterSources()` for connect/disconnect events | Events sent to registered sources |
+| clusterAccessor exists | Cluster deleted | `DeletionTimestamp != nil` (via NotFound) | Call `Disconnect()`, `deleteClusterAccessor()`, `cleanupClusterSourcesForCluster()` | clusterAccessor removed |
 
 ### clusterAccessor Connect/Disconnect
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| `connection=nil` | Connect requested | `Connect()` called | Create REST config from kubeconfig secret | REST config created |
-| REST config ready | Connect requested | Connection creation | Create cached client, uncached client, start cache | Clients and cache ready |
+| `connection=nil` | Connect requested | `Connect()` called, not already connected | Create REST config from kubeconfig secret via `createConnection()` | REST config, clients, cache created |
+| REST config ready | Connect requested | `createConnection()` succeeds | Create cachedClient, uncachedClient, start stoppableCache | Clients and cache ready |
 | Cache starting | Connect requested | Cache.Start() called | Wait for cache to sync (`InitialSyncTimeout`: 5 minutes) | Cache synced, informers ready |
-| All components ready | Connect requested | Successful creation | Generate client cert private key (if needed) | `connection` populated, `lastProbeSuccessTime=now` |
-| Connection creation failed | Connect requested | Any error during creation | Set `lastConnectionCreationErrorTime`, increment failures | `connection=nil`, error returned |
-| `connection!=nil` | Disconnect requested | `Disconnect()` called | Stop cache (stops all informers) | `connection=nil`, cache stopped |
+| All components ready | Connect requested | First successful connect | Generate `clientCertificatePrivateKey` (if not disabled and not already generated) | `connection` populated, `lastProbeSuccessTime=now`, `consecutiveFailures=0` |
+| Connection creation failed | Connect requested | Any error during `createConnection()` | Set `lastConnectionCreationErrorTime=now`, increment `consecutiveFailures`, set `lastProbeTime=now` | `connection=nil`, metrics updated (`connectionUp=0`), error returned |
+| `connection!=nil` | Disconnect requested | `Disconnect()` called | Stop cache via `cache.Stop()` (non-blocking, stops all informers) | `connection=nil`, cache stopped, metrics updated (`connectionUp=0`) |
+| Already connected | Connect requested | `Connect()` called when already connected | Skip with log "Skipping connect, already connected" | No change |
+| Already disconnected | Disconnect requested | `Disconnect()` called when not connected | Skip with log "Skipping disconnect, already disconnected" | No change |
 
 ### Health Checking
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| `lastProbeTime` > interval ago | Connected | `HealthCheck()` called | Execute `GET /` against apiserver with 5s timeout | `lastProbeTime=now` |
-| Probe succeeded | Connected | 200 OK response | Reset failures, update success time | `consecutiveFailures=0`, `lastProbeSuccessTime=now` |
-| Probe failed (non-auth) | Connected | Non-2xx or timeout | Increment failure counter | `consecutiveFailures++` |
-| Probe failed (unauthorized) | Connected | 401 Unauthorized | Signal immediate disconnect | `unauthorizedErrorOccurred=true` |
-| `consecutiveFailures >= 5` | Connected | Threshold exceeded | Signal disconnect needed | `tooManyConsecutiveFailures=true` |
+| Not connected | N/A | `HealthCheck()` called | Skip with log "Skipping health check, not connected", return `(false, false)` | No change |
+| `lastProbeTime` > interval ago | Connected | `HealthCheck()` called | Execute `GET /` against apiserver via `restClient.Get().AbsPath("/").Timeout(5s).DoRaw(ctx)` | `lastProbeTime=now` |
+| Probe succeeded | Connected | 200 OK response | Reset failures, update success time, update metrics | `consecutiveFailures=0`, `lastProbeSuccessTime=now`, `healthCheck=1`, `healthChecksTotal{status=success}++` |
+| Probe failed (non-auth) | Connected | Non-2xx or timeout | Increment failure counter, log with threshold info, update metrics | `consecutiveFailures++`, `healthCheck=0`, `healthChecksTotal{status=error}++` |
+| Probe failed (unauthorized) | Connected | 401 Unauthorized via `apierrors.IsUnauthorized()` | Signal immediate disconnect, increment failures | `consecutiveFailures++`, returns `(tooManyConsecutiveFailures, unauthorizedErrorOccurred=true)` |
+| `consecutiveFailures >= 5` | Connected | Threshold (`HealthProbe.FailureThreshold`) exceeded | Signal disconnect needed | Returns `(tooManyConsecutiveFailures=true, unauthorizedErrorOccurred)` |
+
+### Watch Management
+
+| Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
+|:----------------|:-------------|:--------------------|:----------------------|:-----------------|
+| `watcher.Name()` empty | Watch requested | `Watch()` called with empty name | Return error "watcher.Name() cannot be empty" | Error returned |
+| Not connected | Watch requested | `Watch()` called when `connection=nil` | Return `ErrClusterNotConnected` | Error returned |
+| Watch already exists | Watch requested | `watches.Has(watcher.Name())` returns true | Log "Skip creation of watch...", return nil | No change |
+| New watch | Watch requested | `watches.Has()` returns false | Call `watcher.Watch(cache)`, add to `watches` set | Watch created, informer started, `watches.Insert(name)` |
+| Watch creation failed | Watch requested | `watcher.Watch()` returns error | Return wrapped error | Error returned, watch not added |
 
 ## Watch Management
 
@@ -147,22 +166,34 @@ sequenceDiagram
     participant Cache as Workload Cache
     participant WC as Workload Cluster
     
-    Controller->>CC: Watch(cluster, watcher)
-    CC->>CA: Watch(ctx, watcher)
+    Controller->>CC: Watch(ctx, cluster, watcher)
+    CC->>CC: getClusterAccessor(cluster)
     
-    alt Already watched
-        CA-->>Controller: return nil (skip)
-    else New watch
-        CA->>Cache: watcher.Watch(cache)
-        Cache->>WC: Create Informer
-        WC-->>Cache: Events
-        CA->>CA: watches.Insert(name)
-        CA-->>Controller: return nil
+    alt accessor == nil
+        CC-->>Controller: ErrClusterNotConnected
+    else accessor exists
+        CC->>CA: Watch(ctx, watcher)
+        
+        alt watcher.Name() empty
+            CA-->>Controller: error "watcher.Name() cannot be empty"
+        else Not connected
+            CA-->>Controller: ErrClusterNotConnected
+        else Already watched (watches.Has(name))
+            CA-->>Controller: return nil (skip)
+        else New watch
+            CA->>CA: lock()
+            CA->>Cache: watcher.Watch(cache)
+            Cache->>WC: Create Informer via source.TypedKind
+            WC-->>Cache: Events
+            CA->>CA: watches.Insert(name)
+            CA->>CA: unlock()
+            CA-->>Controller: return nil
+        end
     end
     
-    Note over CA,Cache: On Disconnect, cache stops<br/>and all informers are shutdown
+    Note over CA,Cache: On Disconnect, cache.Stop()<br/>stops all informers
     
-    Note over Controller,CC: After reconnect, Watch()<br/>must be called again
+    Note over Controller,CC: After reconnect, Watch()<br/>must be called again<br/>(watches set is cleared)
 ```
 
 ## Configuration Options
@@ -191,50 +222,63 @@ These values are configured internally in `buildClusterAccessorConfig()`:
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `Timeout` | Health probe HTTP timeout | 5 seconds |
-| `Interval` | Time between health probes | 10 seconds |
+| `Timeout` | Health probe HTTP timeout for `DoRaw()` call | 5 seconds |
+| `Interval` | Time between health probes (via `shouldRequeue()`) | 10 seconds |
 | `FailureThreshold` | Consecutive failures before disconnect | 5 |
 | `ConnectionCreationRetryInterval` | Retry interval after connection failure | 30 seconds |
+| `InitialSyncTimeout` | Timeout waiting for cache to sync after start | 5 minutes |
+| `defaultRequeueAfter` | Fallback requeue duration if no other applies | 10 seconds |
 
 ## Cluster Source Events
 
-The ClusterCache can send events to controllers watching for cluster connectivity changes:
+The ClusterCache can send events to controllers watching for cluster connectivity changes via `GetClusterSource()`:
 
 ```mermaid
 flowchart LR
-    subgraph Events
-        Connect[Connect Event]
-        Disconnect[Disconnect Event]
-        ProbeFailure[Probe Failure Event]
+    subgraph Events["Event Triggers"]
+        Connect[Connect Event<br/>didConnect=true]
+        Disconnect[Disconnect Event<br/>didDisconnect=true]
+        ProbeFailure[Probe Failure Event<br/>WatchForProbeFailure option]
     end
     
-    subgraph Controllers
+    subgraph ClusterCache["sendEventsToClusterSources()"]
+        Check[shouldSendEvent]
+    end
+    
+    subgraph Controllers["Controllers using GetClusterSource"]
         MachineCtrl[Machine Controller]
         MHCCtrl[MachineHealthCheck Controller]
         OtherCtrl[Other Controllers]
     end
     
-    Connect --> MachineCtrl
-    Connect --> MHCCtrl
-    Connect --> OtherCtrl
+    Connect --> Check
+    Disconnect --> Check
+    ProbeFailure --> Check
     
-    Disconnect --> MachineCtrl
-    Disconnect --> MHCCtrl
-    Disconnect --> OtherCtrl
-    
-    ProbeFailure -->|after configured duration| MachineCtrl
-    ProbeFailure -->|after configured duration| MHCCtrl
+    Check -->|via channel| MachineCtrl
+    Check -->|via channel| MHCCtrl
+    Check -->|via channel| OtherCtrl
 ```
+
+### Event Trigger Conditions
+
+| Trigger | Condition | Description |
+|---------|-----------|-------------|
+| Connect | `didConnect=true` | Sent immediately after successful `Connect()` |
+| Disconnect | `didDisconnect=true` | Sent immediately after `Disconnect()` |
+| Probe Failure Duration | `lastProbeSuccessTime + failureDuration < now` AND `lastEventSentTime < shouldSendEventTime` | Sent when health probes haven't succeeded for the configured `WatchForProbeFailure` duration |
 
 ## Error Handling
 
 | Error Type | Behavior | Requeue Strategy |
 |------------|----------|------------------|
-| `ErrClusterNotConnected` | Returned when cluster has no active connection | Caller should handle gracefully |
-| Connection creation failed | Set error time, increment failures | Requeue after 30s |
-| Health probe failed | Increment consecutive failures | Requeue after 10s |
-| Unauthorized error | Immediate disconnect | Immediate requeue |
-| Cluster not found (GET) | Log and return without requeue | No requeue |
+| `ErrClusterNotConnected` | Returned when cluster has no active connection (accessor=nil or connection=nil) | Caller should handle gracefully |
+| Connection creation failed | Set `lastConnectionCreationErrorTime`, increment `consecutiveFailures`, set `lastProbeTime` | Requeue after `ConnectionCreationRetryInterval` (30s) |
+| Health probe failed (non-auth) | Increment `consecutiveFailures`, update metrics | Requeue after `HealthProbe.Interval` (10s) |
+| Health probe unauthorized (401) | `unauthorizedErrorOccurred=true`, immediate disconnect | Immediate requeue (1ms) |
+| `consecutiveFailures >= FailureThreshold` | `tooManyConsecutiveFailures=true`, disconnect | Requeue after `ConnectionCreationRetryInterval` (30s) |
+| Cluster not found (GET) | `Disconnect()`, delete accessor, cleanup sources | No requeue (return nil) |
+| Error getting Cluster object | Log error, return with requeue | Requeue after `defaultRequeueAfter` (10s) |
 
 ## Thread Safety
 

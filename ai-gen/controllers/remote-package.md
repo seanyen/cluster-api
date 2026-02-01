@@ -47,13 +47,14 @@ flowchart TB
 
 | Function | Description |
 |----------|-------------|
-| `NewClusterClient` | Creates a new client for interacting with a remote workload cluster |
-| `RESTConfig` | Returns a REST configuration for a workload cluster |
-| `DefaultClusterAPIUserAgent` | Builds a standardized User-Agent string |
+| `NewClusterClient(ctx, sourceName, c, cluster)` | Creates a new client for interacting with a remote workload cluster. Uses `RESTConfig()` internally and inherits scheme from management cluster client. |
+| `RESTConfig(ctx, sourceName, c, cluster)` | Returns a REST configuration for a workload cluster. Sets UserAgent and Timeout (10s). |
+| `DefaultClusterAPIUserAgent(sourceName)` | Builds a standardized User-Agent string from binary name, version, source name, OS/arch, and git commit |
 
 ### ClusterClientGetter Type
 
 ```go
+// ClusterClientGetter returns a new remote client.
 type ClusterClientGetter func(ctx context.Context, sourceName string, c client.Client, cluster client.ObjectKey) (client.Client, error)
 ```
 
@@ -134,11 +135,11 @@ manager/1.5.0 cluster-controller (linux/amd64) cluster.x-k8s.io/abc1234
 ```mermaid
 flowchart LR
     subgraph Components
-        Command[Command<br/>os.Args[0]]
-        Version[Version<br/>GitVersion]
+        Command[Command<br/>filepath.Base&#40;os.Args[0]&#41;]
+        Version[Version<br/>version.Get&#40;&#41;.GitVersion]
         Source[Source Name<br/>controller name]
         OS[OS/Arch<br/>runtime.GOOS/GOARCH]
-        Commit[Commit<br/>GitCommit[:7]]
+        Commit[Commit<br/>version.Get&#40;&#41;.GitCommit]
     end
     
     Command --> UA[User-Agent String]
@@ -152,11 +153,11 @@ flowchart LR
 
 | Function | Purpose |
 |----------|--------|
-| `adjustCommand(p string)` | Extracts binary name from `os.Args[0]` path via `filepath.Base()` |
-| `adjustVersion(v string)` | Strips pre-release suffixes by splitting on `-` (e.g., `1.5.0-alpha.1` → `1.5.0`) |
+| `adjustCommand(p string)` | Extracts binary name from `os.Args[0]` path via `filepath.Base()`. Returns "unknown" if empty. |
+| `adjustVersion(v string)` | Strips pre-release suffixes by splitting on `-` and taking first segment (e.g., `1.5.0-alpha.1` → `1.5.0`). Returns "unknown" if empty. |
 | `adjustSourceName(c string)` | Returns "unknown" if source name is empty |
-| `adjustCommit(c string)` | Truncates git commit to first 7 characters |
-| `buildUserAgent(...)` | Internal function that assembles the User-Agent string |
+| `adjustCommit(c string)` | Truncates git commit to first 7 characters. Returns "unknown" if empty. |
+| `buildUserAgent(...)` | Internal function that assembles the User-Agent string in format: `{command}/{version} {sourceName} ({os}/{arch}) cluster.x-k8s.io/{commit}` |
 
 ## Kubernetes Reconciler Transition Table (KRTT)
 
@@ -164,18 +165,18 @@ flowchart LR
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| Kubeconfig secret `{cluster-name}-kubeconfig` exists | Client needed | `NewClusterClient()` called | Call `RESTConfig()`, then `client.New()` | `client.Client` returned |
-| Kubeconfig secret missing | Client needed | `NewClusterClient()` called | `kcfg.FromSecret()` returns error | Wrapped error: "failed to retrieve kubeconfig secret..." |
-| Invalid kubeconfig data | Client needed | `clientcmd.RESTConfigFromKubeConfig()` fails | Parse error | Wrapped error: "failed to create REST configuration..." |
-| REST config valid | Client needed | `client.New()` fails | Client creation error | Wrapped error: "failed to create client for Cluster..." |
+| Kubeconfig secret `{cluster-name}-kubeconfig` exists | Client needed | `NewClusterClient()` called | Call `RESTConfig()` to get `*rest.Config`, then `client.New(restConfig, client.Options{Scheme: c.Scheme()})` | `client.Client` returned |
+| Kubeconfig secret missing | Client needed | `NewClusterClient()` called | `kcfg.FromSecret()` returns error | Wrapped error: "failed to retrieve kubeconfig secret for Cluster {namespace}/{name}" |
+| Invalid kubeconfig data | Client needed | `clientcmd.RESTConfigFromKubeConfig()` fails | Parse error | Wrapped error: "failed to create REST configuration for Cluster {namespace}/{name}" |
+| REST config valid | Client needed | `client.New()` fails | Client creation error | Wrapped error: "failed to create client for Cluster {namespace}/{name}" |
 
 ### RESTConfig
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| Kubeconfig secret exists | REST config needed | `RESTConfig()` called | Retrieve secret via `kcfg.FromSecret()`, parse via `clientcmd.RESTConfigFromKubeConfig()` | `*rest.Config` returned with UserAgent and Timeout set |
-| Kubeconfig secret missing | REST config needed | `kcfg.FromSecret()` error | Return wrapped error | Error: "failed to retrieve kubeconfig secret..." |
-| Invalid kubeconfig format | REST config needed | Parse failure | Return wrapped error | Error: "failed to create REST configuration..." |
+| Kubeconfig secret exists | REST config needed | `RESTConfig()` called | Retrieve secret via `kcfg.FromSecret()`, parse via `clientcmd.RESTConfigFromKubeConfig()`, set `UserAgent` and `Timeout=10s` | `*rest.Config` returned |
+| Kubeconfig secret missing | REST config needed | `kcfg.FromSecret()` error | Return wrapped error | Error: "failed to retrieve kubeconfig secret for Cluster {namespace}/{name}" |
+| Invalid kubeconfig format | REST config needed | `clientcmd.RESTConfigFromKubeConfig()` failure | Return wrapped error | Error: "failed to create REST configuration for Cluster {namespace}/{name}" |
 
 ## Usage Examples
 
@@ -286,12 +287,14 @@ All errors are wrapped with context:
 
 ## Important Notes
 
-1. **Secret Naming Convention**: The kubeconfig secret must be named `{cluster-name}-kubeconfig`
+1. **Secret Naming Convention**: The kubeconfig secret must be named `{cluster-name}-kubeconfig` (handled by `kcfg.FromSecret`)
 
-2. **Timeout**: The default 10-second timeout is suitable for most operations but may need adjustment for slow networks
+2. **Timeout**: The default 10-second timeout (`defaultClientTimeout`) is suitable for most operations but may need adjustment for slow networks
 
-3. **Scheme Inheritance**: The created client inherits the scheme from the management cluster client
+3. **Scheme Inheritance**: The created client inherits the scheme from the management cluster client via `client.Options{Scheme: c.Scheme()}`
 
-4. **No Caching**: Clients created via this package do not use informer caching - consider `ClusterCache` for repeated access
+4. **No Caching**: Clients created via this package do not use informer caching - consider `ClusterCache` for repeated access and connection management
 
-5. **User-Agent Best Practice**: Always provide a meaningful `sourceName` to help with debugging and audit logs
+5. **User-Agent Best Practice**: Always provide a meaningful `sourceName` to help with debugging and audit logs. Empty sourceName results in "unknown" in the User-Agent.
+
+6. **Version Helper Behavior**: The `adjustVersion` function uses `strings.SplitN(v, "-", 2)` to strip pre-release suffixes
