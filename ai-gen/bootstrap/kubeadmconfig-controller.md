@@ -68,7 +68,7 @@ graph TB
 | `KubeadmConfig` | Primary | Main resource being reconciled |
 | `Machine` | Secondary (via `MachineToBootstrapMapFunc`) | Owner of KubeadmConfig for regular machines |
 | `MachinePool` | Secondary (via `MachinePoolToBootstrapMapFunc`, feature-gated) | Owner of KubeadmConfig for machine pools |
-| `Cluster` | Secondary (via `ClusterToKubeadmConfigs`) | Infrastructure readiness and control plane endpoint |
+| `Cluster` | Secondary (via `ClusterToKubeadmConfigs` + `ClusterCache.GetClusterSource`) | Infrastructure readiness and control plane endpoint |
 
 ### Owned/Managed Resources
 
@@ -84,7 +84,7 @@ graph TB
 
 | Condition | Description |
 |:----------|:------------|
-| `Ready` | Summary condition aggregating DataSecretAvailable and CertificatesAvailable. True when all conditions are True. |
+| `Ready` | Summary condition aggregating DataSecretAvailable and CertificatesAvailable. True when all conditions are True. Uses custom merge strategy with reasons `Ready`, `NotReady`, or `ReadyUnknown`. |
 | `DataSecretAvailable` | Bootstrap data secret has been created and is available |
 | `CertificatesAvailable` | Required certificates for machine bootstrap are available |
 | `Paused` | Indicates if reconciliation is paused (set via `paused.EnsurePausedCondition`) |
@@ -105,8 +105,15 @@ graph TB
 
 | Condition | Reasons |
 |:----------|:--------|
-| `DataSecretAvailable` | `WaitingForClusterInfrastructure`, `DataSecretGenerationFailed` |
+| `DataSecretAvailable` | `WaitingForClusterInfrastructure`, `WaitingForControlPlaneAvailable`, `DataSecretGenerationFailed` |
 | `CertificatesAvailable` | `CertificatesGenerationFailed`, `CertificatesCorrupted` |
+
+### Condition Setting Pattern
+
+The controller sets both v1beta1 and v1beta2 conditions simultaneously to maintain backward compatibility:
+1. V1Beta1 conditions are set using `v1beta1conditions.MarkTrue/MarkFalse`
+2. V1Beta2 conditions are set using `conditions.Set` with explicit `metav1.Condition`
+3. The defer in `Reconcile` aggregates conditions into summary conditions for both API versions
 
 ## Reconciliation Flow
 
@@ -144,12 +151,17 @@ flowchart TD
     SyncStatus --> EndOK
     
     CheckPivot -->|No| CheckDataSecretCreated{dataSecretCreated<br/>= true?}
-    CheckDataSecretCreated -->|Yes| HandleExisting[Handle Existing Secret<br/>Token Refresh/Rotation]
-    HandleExisting --> EndOK
+    CheckDataSecretCreated -->|Yes| HandleExisting[Handle Existing Secret:<br/>Check BootstrapToken.IsDefined]
+    HandleExisting --> CheckHasNodeRefs{hasNodeRefs?}
+    CheckHasNodeRefs -->|No, Machine| RefreshToken[refreshBootstrapTokenIfNeeded]
+    CheckHasNodeRefs -->|Yes, MachinePool| RotateToken[rotateMachinePoolBootstrapToken]
+    CheckHasNodeRefs -->|Yes, Machine| EndOK
+    RefreshToken --> EndOK
+    RotateToken --> EndOK
     
     CheckDataSecretCreated -->|No| CheckCPInit{ControlPlane<br/>Initialized?}
     CheckCPInit -->|No| HandleNotInit[handleClusterNotInitialized]
-    CheckCPInit -->|Yes| UnlockInit[Unlock Init Lock]
+    CheckCPInit -->|Yes| UnlockInit[Unlock Init Lock<br/>KubeadmInitLock.Unlock]
     
     UnlockInit --> CheckCPMachine{Is Control Plane<br/>Machine?}
     CheckCPMachine -->|Yes| JoinCP[joinControlplane]
@@ -202,27 +214,29 @@ flowchart TD
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| `cluster.status.initialization.infrastructureProvisioned=false` | InitConfiguration defined | Cluster infrastructure not ready | Set conditions False with message: "Waiting for Cluster status.infrastructureReady to be true" | `DataSecretAvailable=False`, `Ready=False` |
-| `infrastructureProvisioned=true`, `ControlPlaneInitialized=false`, is CP machine | InitConfiguration + ClusterConfiguration | First control plane machine needs init | 1. Acquire init lock (ConfigMap `<cluster>-lock`)<br/>2. Generate/lookup certificates (based on ControlPlaneRef)<br/>3. Resolve files/users from secrets<br/>4. Generate cloud-init/Ignition via `handleClusterNotInitialized`<br/>5. Create bootstrap secret via `storeBootstrapData` | `DataSecretAvailable=True`, `CertificatesAvailable=True`, `Ready=True`, `status.dataSecretName` set, `status.initialization.dataSecretCreated=true` |
+| `cluster.status.initialization.infrastructureProvisioned=false` | InitConfiguration defined | Cluster infrastructure not ready | Log "Cluster infrastructure is not ready, waiting", set conditions False with message: "Waiting for Cluster status.infrastructureReady to be true" | `DataSecretAvailable=False`, `Ready=False` |
+| `infrastructureProvisioned=true`, `ControlPlaneInitialized=false`, is CP machine | InitConfiguration + ClusterConfiguration | First control plane machine needs init | 1. Acquire init lock (ConfigMap `<cluster>-lock`)<br/>2. Generate/lookup certificates based on ControlPlaneRef:<br/>   - If `Cluster.Spec.ControlPlaneRef` NOT defined: `LookupOrGenerateCached` (standalone CP)<br/>   - If `Cluster.Spec.ControlPlaneRef` defined: `LookupCached` only (KCP manages certs)<br/>3. Resolve files/users from secrets<br/>4. Generate cloud-init/Ignition via `handleClusterNotInitialized`<br/>5. Create bootstrap secret via `storeBootstrapData`<br/>6. Return OK (no requeue for init) | `DataSecretAvailable=True`, `CertificatesAvailable=True`, `Ready=True`, `status.dataSecretName` set, `status.initialization.dataSecretCreated=true` |
 | `infrastructureProvisioned=true`, `ControlPlaneInitialized=false`, is CP machine, lock held by another | InitConfiguration | Another CP machine already initializing | Log "A control plane is already being initialized", requeue after 30s | No condition change, requeue |
-| `infrastructureProvisioned=true`, `ControlPlaneInitialized=false`, is worker | JoinConfiguration | Worker waiting for CP initialization | Requeue after 30s | `DataSecretAvailable=False` (Message: "Waiting for Cluster control plane to be initialized") |
+| `infrastructureProvisioned=true`, `ControlPlaneInitialized=false`, is worker | JoinConfiguration | Worker waiting for CP initialization | Initialize DataSecretAvailable condition if missing, requeue after 30s | `DataSecretAvailable=False` (Message: "Waiting for Cluster control plane to be initialized") |
 
 ### Control Plane Join
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| `ControlPlaneInitialized=true`, CP machine, `dataSecretCreated=false` | JoinConfiguration with ControlPlane | CP join triggered via `joinControlplane` | 1. Unlock init lock<br/>2. Lookup certificates (`NewControlPlaneJoinCerts`)<br/>3. `reconcileDiscovery` (token/CA hashes/endpoint)<br/>4. Generate join cloud-init/Ignition<br/>5. Store secret via `storeBootstrapData`<br/>6. Requeue after `TTL/3` | `DataSecretAvailable=True`, `CertificatesAvailable=True`, `Ready=True`, requeue for token refresh |
-| `ControlPlaneInitialized=true`, CP machine, missing `ControlPlaneEndpoint` | JoinConfiguration | Waiting for LB endpoint | Log "Waiting for Cluster Controller to set Cluster.Spec.ControlPlaneEndpoint", requeue after 10s | Unchanged (waiting) |
+| `ControlPlaneInitialized=true`, CP machine, `dataSecretCreated=false` | JoinConfiguration with ControlPlane | CP join triggered via `joinControlplane` | 1. Lookup certificates (`NewControlPlaneJoinCerts` + `EnsureAllExist`)<br/>2. `reconcileDiscovery` (token/CA hashes/endpoint)<br/>3. Generate join cloud-init/Ignition<br/>4. Store secret via `storeBootstrapData`<br/>5. Requeue after `TTL/3` | `DataSecretAvailable=True`, `CertificatesAvailable=True`, `Ready=True`, requeue for token refresh |
+| `ControlPlaneInitialized=true`, CP machine, missing `ControlPlaneEndpoint` | JoinConfiguration | Waiting for LB endpoint via `reconcileDiscovery` | Log "Waiting for Cluster Controller to set Cluster.Spec.ControlPlaneEndpoint", requeue after 10s | Unchanged (waiting) |
 | `ControlPlaneInitialized=true`, CP machine, certificates lookup fails | JoinConfiguration | Certificates not found or EnsureAllExist fails | Set `CertificatesAvailable=Unknown`, Reason: `InternalError`, return error | `Ready=Unknown`, requeue with backoff |
 
 ### Worker Join
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
-| `ControlPlaneInitialized=true`, worker machine, `dataSecretCreated=false` | JoinConfiguration (no ControlPlane field) | Worker join triggered via `joinWorker` | 1. Lookup CA certificate (`NewCertificatesForWorker`)<br/>2. Add `NodeUninitializedTaint` to JoinConfiguration (temporary, not persisted)<br/>3. `reconcileDiscovery`<br/>4. Generate join cloud-init/Ignition<br/>5. Store secret via `storeBootstrapData`<br/>6. Requeue for token refresh (`TTL/3`) | `DataSecretAvailable=True`, `CertificatesAvailable=True`, `Ready=True` |
+| `ControlPlaneInitialized=true`, worker machine, `dataSecretCreated=false` | JoinConfiguration (no ControlPlane field) | Worker join triggered via `joinWorker` | 1. Lookup CA certificate (`NewCertificatesForWorker` + `EnsureAllExist`)<br/>2. Add `NodeUninitializedTaint` to JoinConfiguration copy (temporary, not persisted to spec)<br/>3. `reconcileDiscovery`<br/>4. Generate join cloud-init/Ignition<br/>5. Store secret via `storeBootstrapData`<br/>6. Requeue for token refresh (`TTL/3`) | `DataSecretAvailable=True`, `CertificatesAvailable=True`, `Ready=True` |
 | Worker machine, `JoinConfiguration.ControlPlane` set | Invalid spec | Misconfiguration detected | Return error: "Machine is a Worker, but JoinConfiguration.ControlPlane is set in the KubeadmConfig object" | Error state, requeue with backoff |
 
 ### Bootstrap Token Management
+
+Bootstrap tokens are only created/managed when `spec.JoinConfiguration.Discovery.BootstrapToken` is defined. For file-based discovery (`spec.JoinConfiguration.Discovery.File`), no tokens are created.
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:----------------|:-------------|:--------------------|:----------------------|:-----------------|
@@ -303,7 +317,7 @@ sequenceDiagram
     end
     
     Note over M1,M2: After CP initialized...
-    M1->>API: Unlock (delete ConfigMap)<br/>via joinControlplane/joinWorker
+    M1->>API: Unlock (delete ConfigMap)<br/>via reconcile before join
     API-->>M1: Deleted
 ```
 
@@ -471,7 +485,7 @@ stateDiagram-v2
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
 
 # Events for status reporting
-- apiGroups: ["core"]
+- apiGroups: [""]
   resources: ["events"]
   verbs: ["create", "patch"]
 ```
@@ -487,13 +501,13 @@ stateDiagram-v2
 
 | Function | Location | Purpose |
 |:---------|:---------|:--------|
-| `Reconcile` | Controller | Main entry point, orchestrates reconciliation, handles patching in defer |
-| `reconcile` | Controller | Core reconciliation logic after initial checks (infrastructure, pivot, existing secret) |
+| `Reconcile` | Controller | Main entry point, orchestrates reconciliation, handles patching in defer. The defer function sets summary conditions (v1beta1 and v1beta2 Ready), patches the object, and only sets ObservedGeneration on successful reconciliation |
+| `reconcile` | Controller | Core reconciliation logic after initial checks (infrastructure, pivot, existing secret). Called after pause check and deletion check |
 | `handleClusterNotInitialized` | Controller | Handles first CP machine init with locking, generates init bootstrap data |
 | `joinControlplane` | Controller | Generates bootstrap data for control plane join (`kubeadm join --control-plane`) |
 | `joinWorker` | Controller | Generates bootstrap data for worker node join (`kubeadm join`) |
-| `reconcileDiscovery` | Controller | Configures bootstrap token discovery (token, CA hashes, API endpoint) |
-| `reconcileDiscoveryFile` | Controller | Handles file-based discovery kubeconfig generation |
+| `reconcileDiscovery` | Controller | Configures bootstrap token discovery (token, CA hashes, API endpoint). Respects user-provided file discovery config, otherwise auto-generates token |
+| `reconcileDiscoveryFile` | Controller | Handles file-based discovery kubeconfig generation. Auto-populates server and CA data from Cluster if not provided |
 | `refreshBootstrapTokenIfNeeded` | Controller | Extends token TTL for pending nodes (non-MachinePool) |
 | `rotateMachinePoolBootstrapToken` | Controller | Rotates tokens for MachinePool scale-ups |
 | `recreateBootstrapToken` | Controller | Creates new token and regenerates bootstrap data |
