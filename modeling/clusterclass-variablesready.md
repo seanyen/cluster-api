@@ -14,11 +14,12 @@ The `VariablesReady` condition on a ClusterClass indicates whether the variable 
 
 | Guard (Observed predicate) | Ensure (Idempotent reconcile action) | Condition transition (ONLY `VariablesReady`) | Next reconcile (Return) |
 |---|---|---|---|
-| `variableDiscoveryError == nil && all inline variables valid && all external DiscoverVariables calls succeeded` | Update status.variables with all variable definitions | `VariablesReady=True; Reason=VariablesReady; Message=""; ObservedGeneration=metadata.generation` | `none` |
-| `error calling DiscoverVariables extension` | Aggregate error from extension calls | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="failed to call DiscoverVariables for patch <name>: <error>"; ObservedGeneration=metadata.generation` | `none` |
-| `DiscoverVariables extension returned non-success status` | Aggregate error from extension response | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="patch <name> returned status <status> with message <msg>"; ObservedGeneration=metadata.generation` | `none` |
-| `DiscoverVariables returned invalid variable definitions` | Validate variables and aggregate errors | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="<validation errors>"; ObservedGeneration=metadata.generation` | `none` |
-| `error converting variables from v1beta1 to v1beta2` | Aggregate conversion errors | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="failed to convert variable <name> to v1beta2"; ObservedGeneration=metadata.generation` | `none` |
+| `error calling DiscoverVariables extension (RuntimeSDK enabled && patch.External.DiscoverVariablesExtension != "")` | Aggregate error; return error to trigger retry | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="VariableDiscovery failed: failed to call DiscoverVariables for patch <name>: <error>"; ObservedGeneration=metadata.generation` | `requeue` (error return) |
+| `DiscoverVariables extension returned non-success status` | Aggregate error; return error to trigger retry | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="VariableDiscovery failed: patch <name> returned status <status> with message <msg>"; ObservedGeneration=metadata.generation` | `requeue` (error return) |
+| `error converting variables from v1beta1 to v1beta2` | Aggregate conversion error; return error to trigger retry | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="VariableDiscovery failed: failed to convert variable <name> to v1beta2"; ObservedGeneration=metadata.generation` | `requeue` (error return) |
+| `DiscoverVariables returned variables that fail ValidateClusterClassVariables()` | Aggregate validation errors; return error to trigger retry | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="VariableDiscovery failed: <validation errors>"; ObservedGeneration=metadata.generation` | `requeue` (error return) |
+| `status.variables contains variables with definitionsConflict=true` | Set variableDiscoveryError; return error to trigger retry | `VariablesReady=False; Reason=VariableDiscoveryFailed; Message="VariableDiscovery failed: the following variables have conflicting schemas: <names>"; ObservedGeneration=metadata.generation` | `requeue` (error return) |
+| `all inline variables processed && all external DiscoverVariables calls succeeded && no conflicting definitions` | Update status.variables with sorted variable definitions | `VariablesReady=True; Reason=VariablesReady; Message=""; ObservedGeneration=metadata.generation` | `none` |
 
 ---
 
@@ -42,3 +43,7 @@ The `VariablesReady` condition on a ClusterClass indicates whether the variable 
 6. **Watch-Driven**: The reconciler watches:
    - ClusterClass objects
    - ExtensionConfig objects (to re-reconcile when extensions change)
+
+7. **Error Handling**: All error paths in `reconcileVariables` return an error to the controller runtime, which triggers a requeue with exponential backoff. The `variableDiscoveryError` is captured in scope for status update before the error is returned.
+
+8. **Stable Ordering**: Variables in `status.variables` are alphabetically sorted by name to prevent unnecessary status updates.
