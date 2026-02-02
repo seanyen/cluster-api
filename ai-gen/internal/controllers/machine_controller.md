@@ -8,17 +8,22 @@ The Machine Controller manages the lifecycle of individual `Machine` resources, 
 flowchart TB
     subgraph "Machine Controller"
         R[Reconcile] --> F{Fetch Machine}
-        F -->|Not Found| End[Return]
-        F -->|Found| Fin[Add Finalizer]
-        Fin --> GC[Get Cluster]
-        GC --> P{Paused?}
-        P -->|Yes| PC[Set Paused Condition]
-        P -->|No| D{Deleting?}
+        F -->|Not Found| End[Return nil]
+        F -->|Error| Err[Return error]
+        F -->|Found| Fin{EnsureFinalizer}
+        Fin -->|Added/Error| FinRet[Return]
+        Fin -->|Already has| LOG[AddOwners to log context]
+        LOG --> GC[Get Cluster]
+        GC -->|Error| GCE[Return error]
+        GC --> P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| OWN[Get owningMachineSet/MachineDeployment]
+        OWN --> D{Deleting?}
         D -->|Yes| RD[reconcileDelete]
         D -->|No| RN[reconcileNormal]
     end
     
-    subgraph "Always Reconcile Phases"
+    subgraph "Always Reconcile Phases (both delete and normal)"
         OL[reconcileMachineOwnerAndLabels]
         B[reconcileBootstrap]
         I[reconcileInfrastructure]
@@ -30,19 +35,25 @@ flowchart TB
         IPU[reconcileInPlaceUpdate]
     end
     
-    subgraph "Delete Phases"
-        PreDrain[Pre-Drain Hook]
+    subgraph "Delete Phases (after always phases)"
+        IDA[isDeleteNodeAllowed?]
+        PreDrain[Pre-Drain Hook check]
         Drain[Drain Node]
         VolumeDetach[Wait Volume Detach]
-        PreTerm[Pre-Terminate Hook]
+        PreTerm[Pre-Terminate Hook check]
         DelInfra[Delete Infrastructure]
         DelBoot[Delete Bootstrap]
         DelNode[Delete Node]
         RemFin[Remove Finalizer]
     end
     
+    subgraph "Defer: updateStatus + patchMachine"
+        US[updateStatus: phase, conditions]
+        PM[patchMachine with owned conditions]
+    end
+    
     RN --> OL --> B --> I --> N --> CE --> IPU
-    RD --> OL --> B --> I --> N --> CE --> PreDrain --> Drain --> VolumeDetach --> PreTerm --> DelInfra --> DelBoot --> DelNode --> RemFin
+    RD --> OL --> B --> I --> N --> CE --> IDA --> PreDrain --> Drain --> VolumeDetach --> PreTerm --> DelInfra --> DelBoot --> DelNode --> RemFin
 ```
 
 ## Reconciliation Phases
@@ -118,27 +129,42 @@ Handles machine deletion with ordered cleanup.
 
 ```mermaid
 flowchart TD
-    A[Start] --> B{Delete Node Allowed?}
-    B -->|No| Skip[Skip to Infrastructure]
-    B -->|Yes| C{Pre-Drain Hooks?}
-    C -->|Yes| D[Wait for hooks]
-    C -->|No| E{Drain Allowed?}
-    E -->|No| F[Skip drain]
-    E -->|Yes| G[Drain Node]
-    G -->|In Progress| H[Requeue]
-    G -->|Complete| I{Volume Detach Allowed?}
-    I -->|No| J[Skip volume detach]
-    I -->|Yes| K[Wait for Volumes]
-    K -->|In Progress| L[Requeue]
-    K -->|Complete| M{Pre-Terminate Hooks?}
-    M -->|Yes| N[Wait for hooks]
-    M -->|No| Skip
-    Skip --> O[Delete Infrastructure]
-    O -->|In Progress| P[Wait]
-    O -->|Complete| Q[Delete Bootstrap]
-    Q -->|In Progress| R[Wait]
-    Q -->|Complete| S[Delete Node]
-    S --> T[Remove Finalizer]
+    A[Start] --> B[Set fallback: deletingReason=Reason, deletingMessage=Deletion started]
+    B --> C{isDeleteNodeAllowed?}
+    C -->|No - errNoControlPlaneNodes| Skip[Skip node operations]
+    C -->|No - errLastControlPlaneNode| Skip
+    C -->|No - errNilNodeRef| Skip
+    C -->|No - errClusterIsBeingDeleted| Skip
+    C -->|No - errControlPlaneIsBeingDeleted| Skip
+    C -->|Other Error| InternalErr[deletingReason: InternalError<br/>Return error]
+    C -->|Yes| D{Pre-Drain Hook annotations?}
+    D -->|Yes| E[deletingReason: WaitingForPreDrainHook<br/>Return - wait for annotation removal]
+    D -->|No| F{isNodeDrainAllowed?}
+    F -->|No| G[Skip drain]
+    F -->|Yes| H[Set NodeDrainStartTime]
+    H --> I[drainNode]
+    I -->|In Progress| J[deletingReason: DrainingNode<br/>Requeue after 20s]
+    I -->|Complete| K{isNodeVolumeDetachAllowed?}
+    I -->|Error| DrainErr[deletingReason: DrainingNode<br/>Return error]
+    G --> K
+    K -->|No| L[Skip volume detach]
+    K -->|Yes| M[Set WaitForNodeVolumeDetachStartTime]
+    M --> N[waitForVolumeDetach]
+    N -->|In Progress| O[deletingReason: WaitingForVolumeDetach<br/>Requeue after 20s]
+    N -->|Complete| P{Pre-Terminate Hook annotations?}
+    N -->|Timeout| P
+    L --> P
+    P -->|Yes| Q[deletingReason: WaitingForPreTerminateHook<br/>Return - wait for annotation removal]
+    P -->|No| Skip
+    Skip --> R[Delete InfraMachine]
+    R -->|In Progress| S[deletingReason: WaitingForInfrastructureDeletion<br/>Return]
+    R -->|Complete| T[Delete BootstrapConfig]
+    T -->|In Progress| U[deletingReason: WaitingForBootstrapDeletion<br/>Return]
+    T -->|Complete| V{isDeleteNodeAllowed & NodeRef set?}
+    V -->|Yes| W[deleteNode]
+    V -->|No| X[Skip node deletion]
+    W --> X
+    X --> Y[Remove Finalizer]
 ```
 
 ## KRTT - Kubernetes Reconciler Transition Table
@@ -147,32 +173,38 @@ flowchart TD
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
-| Phase=Pending | Bootstrap.ConfigRef defined | Initial creation | Get bootstrap object, set owner ref | Phase=Provisioning |
-| BootstrapReady=False | ConfigRef defined | Bootstrap created | Watch bootstrap, wait for dataSecretCreated | BootstrapReady mirrors bootstrap |
-| BootstrapReady=False | ConfigRef defined | dataSecretCreated=true | Copy dataSecretName to Machine.spec | BootstrapDataSecretCreated=True |
-| InfrastructureReady=False | InfraRef defined | Bootstrap ready | Get infra object, set owner ref | InfrastructureReady mirrors infra |
-| InfrastructureReady=False | InfraRef defined | Infra provisioned=true | Wait for ProviderID | InfrastructureReady=False |
+| Machine not found | - | Object deleted | Return nil (no-op) | - |
+| Machine without finalizer | Any | Object fetched | Add `machine.cluster.x-k8s.io` finalizer, return | Machine with finalizer |
+| Machine paused | Any | Paused annotation or Cluster paused | `EnsurePausedCondition` sets condition | Paused=True |
+| Stand-alone machine | No MachineSet owner | First reconcile | Set Cluster as owner reference | Machine has Cluster owner |
+| Phase=Pending | Bootstrap.ConfigRef defined | Initial creation | Get bootstrap object, set owner ref, watch | BootstrapConfigReady mirrors bootstrap |
+| BootstrapReady=False | ConfigRef defined | Bootstrap created | Wait for dataSecretCreated | BootstrapReady=False |
+| BootstrapReady=False | ConfigRef defined | dataSecretCreated=true on bootstrap | Get dataSecretName, set on Machine.spec | BootstrapDataSecretCreated=True |
+| InfrastructureReady=False | InfraRef defined | Bootstrap ready | Get infra object, set owner ref, watch | InfrastructureReady mirrors infra |
+| InfrastructureReady=False | InfraRef defined | Infra provisioned=true | Wait for ProviderID and addresses | InfrastructureReady=False |
 | InfrastructureReady=False | InfraRef defined | ProviderID set | Copy ProviderID, addresses, failureDomain | InfrastructureProvisioned=True |
-| NodeRef=nil | ProviderID set | Infra ready | Find node by ProviderID | NodeRef set if found |
-| NodeRef set | - | Node exists | Sync labels/annotations to node | NodeHealthy/Ready updated |
-| Phase=Provisioning | All ready | Node associated | Update phase | Phase=Running |
+| NodeRef=nil | ProviderID set | Infra ready | Find node by ProviderID via ClusterCache | NodeRef set if found |
+| NodeRef set | - | Node exists | Sync labels/annotations to node | NodeReady/NodeHealthy updated |
+| Phase=Provisioning | All ready | Node associated | setPhase in updateStatus | Phase=Running |
 
 ### Deletion Reconciliation
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
-| DeletionTimestamp!=nil | - | User deletes Machine | Check delete allowed | Deleting condition set |
-| Has pre-drain hook annotation | - | Hook annotation present | Wait for hook owner to remove annotation | PreDrainDeleteHookSucceeded=False |
-| No pre-drain hooks | NodeRef set | Pre-drain complete | Start node drain | DrainingSucceeded=False |
-| Draining in progress | - | Pods being evicted | Continue draining, handle timeouts | Deleting reason=DrainingNode |
-| Draining complete | - | All pods evicted/skipped | Start volume detach wait | DrainingSucceeded=True |
-| Waiting for volumes | - | Volumes attached | Wait for volume detachment | Deleting reason=WaitingForVolumeDetach |
-| Volumes detached | - | All volumes detached | Check pre-terminate hooks | VolumeDetachSucceeded=True |
-| Has pre-terminate hook annotation | - | Hook annotation present | Wait for hook owner to remove annotation | PreTerminateDeleteHookSucceeded=False |
+| DeletionTimestamp!=nil | - | User deletes Machine | Run alwaysReconcile phases first, then reconcileDelete | Deleting=True (default reason) |
+| isDeleteNodeAllowed=false | - | errNoControlPlaneNodes/errLastControlPlaneNode/etc | Skip node operations (drain, volume detach, node delete) | Continue to infra delete |
+| Has pre-drain hook annotation | - | Annotation with prefix `pre-drain.delete.hook.machine` | Wait for hook owner to remove annotation | Deleting reason=WaitingForPreDrainHook |
+| No pre-drain hooks | NodeRef set | isNodeDrainAllowed=true | Set NodeDrainStartTime, start node drain | DrainingSucceeded=False |
+| Draining in progress | - | Pods being evicted | Continue draining, handle timeouts per MachineDrainRules | Deleting reason=DrainingNode |
+| Draining complete | - | All pods evicted/skipped | Mark DrainingSucceeded=True | DrainingSucceeded=True |
+| isNodeVolumeDetachAllowed=true | - | Drain complete | Set WaitForNodeVolumeDetachStartTime, wait for volumes | Deleting reason=WaitingForVolumeDetach |
+| Waiting for volumes | - | CSI volumes still attached | Wait for volume detachment with timeout | Deleting reason=WaitingForVolumeDetach |
+| Volumes detached or timeout | - | All volumes detached OR timeout exceeded | Check pre-terminate hooks | VolumeDetachSucceeded=True |
+| Has pre-terminate hook annotation | - | Annotation with prefix `pre-terminate.delete.hook.machine` | Wait for hook owner to remove annotation | Deleting reason=WaitingForPreTerminateHook |
 | No pre-terminate hooks | InfraRef exists | Pre-terminate complete | Delete infrastructure object | Deleting reason=WaitingForInfrastructureDeletion |
-| Infra deleted | Bootstrap.ConfigRef exists | Infra gone | Delete bootstrap object | Deleting reason=WaitingForBootstrapDeletion |
-| Bootstrap deleted | NodeRef set | Bootstrap gone | Delete Kubernetes node | Deleting reason=DeletingNode |
-| Node deleted | - | Node gone | Remove finalizer | Object deleted by GC |
+| Infra deleted | Bootstrap.ConfigRef exists | Infra gone | Delete bootstrap config | Deleting reason=WaitingForBootstrapDeletion |
+| Bootstrap deleted | NodeRef set & allowed | Bootstrap gone | Delete Kubernetes node (with retry) | Deleting reason=DeletingNode |
+| Node deleted | - | Node gone or not allowed | Remove finalizer | Object deleted by GC |
 
 ### Error Handling
 

@@ -6,35 +6,38 @@ The MachineSet Controller manages `MachineSet` resources, ensuring the desired n
 
 ```mermaid
 flowchart TB
-    subgraph "MachineSet Controller"
+    subgraph \"MachineSet Controller\"
         R[Reconcile] --> F{Fetch MachineSet}
-        F -->|Not Found| End[Return]
-        F -->|Found| Fin[Add Finalizer]
-        Fin --> GC[Get Cluster]
-        GC --> P{Paused?}
-        P -->|Yes| PC[Set Paused Condition & Return]
-        P -->|No| D{Deleting?}
+        F -->|Not Found| End[Return nil]
+        F -->|Error| Err[Return error]
+        F -->|Found| Fin{EnsureFinalizer}
+        Fin -->|Added/Error| FinRet[Return]
+        Fin -->|Already has| GC[Get Cluster]
+        GC -->|Error| GCE[Return error]
+        GC --> P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| D{Deleting?}
         D -->|Yes| RD[reconcileDelete]
         D -->|No| RN[reconcileNormal]
     end
     
-    subgraph "Always Reconcile"
+    subgraph \"Always Reconcile\"
         OL[reconcileMachineSetOwnerAndLabels]
-        RI[reconcileInfrastructure]
-        RB[reconcileBootstrapConfig]
+        RI[reconcileInfrastructure - get template]
+        RB[reconcileBootstrapConfig - get template]
         GAM[getAndAdoptMachinesForMachineSet]
     end
     
-    subgraph "Normal Phases"
+    subgraph \"Normal Phases\"
         RU[reconcileUnhealthyMachines]
-        SM[syncMachines]
-        TIP[triggerInPlaceUpdate]
-        SR[syncReplicas]
+        SM[syncMachines - sync labels/annotations]
+        TIP[triggerInPlaceUpdate - if feature enabled]
+        SR[syncReplicas - scale up/down]
     end
     
-    subgraph "Delete Phase"
-        DM[Delete Machines]
-        RF[Remove Finalizer]
+    subgraph \"Delete Phase\"
+        DM[Delete all owned Machines]
+        RF[Remove Finalizer when all deleted]
     end
     
     RN --> OL --> RI --> RB --> GAM --> RU --> SM --> TIP --> SR

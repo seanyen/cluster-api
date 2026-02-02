@@ -6,22 +6,23 @@ The ExtensionConfig Controller manages `ExtensionConfig` resources, which config
 
 ```mermaid
 flowchart TB
-    subgraph "ExtensionConfig Controller"
+    subgraph \"ExtensionConfig Controller\"
         R[Reconcile] --> W{Registry Ready?}
         W -->|No| RQ[Requeue after 10s]
         W -->|Yes| F{Fetch ExtensionConfig}
-        F -->|Not Found| RD[Unregister from Registry]
+        F -->|Not Found| RD[Unregister from Registry, Return nil]
+        F -->|Error| Err[Return error]
         F -->|Found| D{Deleting?}
-        D -->|Yes| RD2[Unregister from Registry]
+        D -->|Yes| RD2[Unregister from Registry, Return nil]
         D -->|No| RN[reconcileNormal]
     end
     
-    subgraph "Normal Reconcile"
+    subgraph \"Normal Reconcile\"
         RO{ReadOnly Mode?}
         V[Validate ExtensionConfig]
-        RC[Reconcile CA Bundle]
-        DIS[Discover Extensions]
-        REG[Register in Registry]
+        RC[reconcileCABundle - inject from Secret if annotated]
+        DIS[discoverExtension - call Discovery endpoint]
+        REG[Register handlers in Registry]
     end
     
     RN --> RO

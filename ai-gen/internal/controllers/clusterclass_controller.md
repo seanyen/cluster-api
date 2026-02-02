@@ -6,19 +6,20 @@ The ClusterClass Controller manages `ClusterClass` resources, validating templat
 
 ```mermaid
 flowchart TB
-    subgraph "ClusterClass Controller"
+    subgraph \"ClusterClass Controller\"
         R[Reconcile] --> F{Fetch ClusterClass}
-        F -->|Not Found| End[Return]
-        F -->|Found| P{Paused?}
-        P -->|Yes| PC[Set Paused Condition & Return]
-        P -->|No| D{Deleting?}
-        D -->|Yes| DE[Return - no deletion logic]
+        F -->|Not Found| End[Return nil]
+        F -->|Error| Err[Return error]
+        F -->|Found| P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| D{Deleting?}
+        D -->|Yes| DE[Return nil - no deletion logic needed]
         D -->|No| RN[reconcileNormal]
     end
     
-    subgraph "Reconcile Phases"
-        RE[reconcileExternalReferences]
-        RV[reconcileVariables]
+    subgraph \"Reconcile Phases\"
+        RE[reconcileExternalReferences - get templates, set owners]
+        RV[reconcileVariables - inline + external discovery]
     end
     
     RN --> RE --> RV

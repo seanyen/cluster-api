@@ -6,31 +6,36 @@ The MachineDeployment Controller manages `MachineDeployment` resources, implemen
 
 ```mermaid
 flowchart TB
-    subgraph "MachineDeployment Controller"
+    subgraph \"MachineDeployment Controller\"
         R[Reconcile] --> F{Fetch MachineDeployment}
-        F -->|Not Found| End[Return]
-        F -->|Found| Fin[Add Finalizer]
-        Fin --> GC[Get Cluster]
-        GC --> P{Paused?}
-        P -->|Yes| PC[Set Paused Condition & Return]
-        P -->|No| D{Deleting?}
+        F -->|Not Found| End[Return nil]
+        F -->|Error| Err[Return error]
+        F -->|Found| Fin{EnsureFinalizer}
+        Fin -->|Added/Error| FinRet[Return]
+        Fin -->|Already has| GC[Get Cluster]
+        GC -->|Error| GCE[Return error]
+        GC --> P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| D{Deleting?}
         D -->|Yes| RD[reconcileDelete]
         D -->|No| RN[reconcile]
     end
     
-    subgraph "Reconcile Flow"
+    subgraph \"Reconcile Flow\"
         GT[getTemplatesAndSetOwner]
         GA[getAndAdoptMachineSetsForDeployment]
+        PP{spec.paused?}
         ST{Strategy Type}
         RU[rolloutRollingUpdate]
         OD[rolloutOnDelete]
-        SY[sync]
+        SY[sync - scale only, no rollout]
     end
     
-    RN --> GT --> GA --> ST
+    RN --> GT --> GA --> PP
+    PP -->|Yes| SY
+    PP -->|No| ST
     ST -->|RollingUpdate| RU
     ST -->|OnDelete| OD
-    ST -->|spec.paused=true| SY
 ```
 
 ## Rollout Strategies

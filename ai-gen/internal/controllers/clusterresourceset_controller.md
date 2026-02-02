@@ -9,52 +9,77 @@ flowchart TB
     subgraph "ClusterResourceSet Controller"
         R[Reconcile] --> F{Fetch CRS}
         F -->|Not Found| End[Return nil]
-        F -->|Found| Fin[EnsureFinalizer]
-        Fin --> P{Paused?}
-        P -->|Yes| PC[Set Paused Condition & Return]
-        P -->|No| GC[Get Matching Clusters]
-        GC --> D{Deleting?}
+        F -->|Error| Err[Return error]
+        F -->|Found| Fin{EnsureFinalizer}
+        Fin -->|Added/Error| FinRet[Return]
+        Fin -->|Already has| P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| GC[Get Matching Clusters]
+        GC -->|Error| GCE[Set Condition, Return error]
+        GC -->|Empty selector| GCN[Log, Return nil]
+        GC -->|Success| D{Deleting?}
         D -->|Yes| RD[reconcileDelete]
         D -->|No| RN[ApplyClusterResourceSet<br/>for each cluster]
+        RN --> AE{Any errors?}
+        AE -->|Conflict error| RQ[Requeue after 100ms]
+        AE -->|Other errors| AG[Return aggregate error]
+        AE -->|No errors| OK[Return nil]
     end
     
     subgraph "Delete Flow"
         RD --> FB[For Each Cluster]
         FB --> GB[Get ClusterResourceSetBinding]
-        GB --> RB[Remove CRS from Binding]
+        GB -->|Not Found| RF1[Remove Finalizer, Return]
+        GB -->|Error| RDE[Return error]
+        GB -->|Found| RB[Remove CRS from Binding<br/>Remove OwnerRef]
         RB --> CB{Binding Empty?}
         CB -->|Yes| DB[Delete Binding]
         CB -->|No| PB[Patch Binding]
-        DB --> RF[Remove Finalizer]
-        PB --> RF
+        DB --> NX[Next Cluster]
+        PB --> NX
+        NX --> FB
     end
+    FB --> RF[Remove Finalizer]
 ```
 
 ## Resource Application Flow
 
 ```mermaid
 flowchart TD
-    A[ApplyClusterResourceSet] --> B[Get Resources<br/>ConfigMap/Secret]
-    B --> C{Resource Found?}
-    C -->|No - NotFound| Skip[Continue to next resource]
-    C -->|No - Other Error| ErrRes[Add to error list]
-    C -->|Yes| D[Ensure OwnerRef on Resource]
-    D --> E[Get/Create ClusterResourceSetBinding]
-    E --> F[Ensure OwnerRef on Binding]
-    F --> G[Get Remote Client via ClusterCache]
-    G --> H{Client Available?}
-    H -->|No| ErrClient[Set Condition False<br/>Return Error]
-    H -->|Yes| I[Ensure K8s Service Created]
-    I --> J[For Each Resource]
-    J --> K[Create ResourceReconcileScope]
-    K --> L{needsApply?}
-    L -->|No| M[Skip - Already Applied]
-    L -->|Yes| N[Apply to Workload Cluster]
-    N --> O{Apply Success?}
-    O -->|Yes| P[Set Binding: Applied=true, Hash]
-    O -->|No| Q[Set Binding: Applied=false]
-    P --> R[Set ResourcesApplied=True]
-    Q --> S[Set ResourcesApplied=False]
+    A[ApplyClusterResourceSet] --> B[For Each Resource in Spec]
+    B --> C[getResource<br/>ConfigMap/Secret]
+    C --> D{Resource Found?}
+    D -->|Not Found| Skip[Log, Continue to next]
+    D -->|WrongSecretType| ErrSec[Set Condition, Add error]
+    D -->|Other Error| ErrRes[Set Condition, Add error]
+    D -->|Success| E[ensureResourceOwnerRef]
+    E --> F{OwnerRef Error?}
+    F -->|Yes| ErrOwn[Log, Add error]
+    F -->|No| G[Store in objList]
+    
+    B --> H{Any errors?}
+    H -->|Yes| ErrRet[Return aggregate error]
+    H -->|No| I[getOrCreateClusterResourceSetBinding]
+    I --> J[EnsureOwnerRef on Binding]
+    J --> K[Get/Create ResourceSetBinding entry]
+    K --> L[ClusterCache.GetClient]
+    L -->|Error| ErrClient[Set Condition, Return error]
+    L -->|Success| M[ensureKubernetesServiceCreated]
+    M -->|Error| ErrSvc[Return error]
+    M -->|Success| N[For Each Resource]
+    
+    N --> O[reconcileScopeForResource]
+    O -->|Error| ErrScope[SetBinding Applied=false, Add error]
+    O -->|Success| P{needsApply?}
+    P -->|No| Q[Skip to next]
+    P -->|Yes| R[SetBinding Applied=false initially]
+    R --> S[resourceScope.apply]
+    S -->|Error| T[Log error, Set Condition, Add error]
+    S -->|Success| U[SetBinding Applied=true, Hash=computed]
+    
+    N --> V{All done?}
+    V -->|Errors| W[Return aggregate]
+    V -->|Success| X[Set ResourcesApplied=True]
 ```
 
 ## KRTT - Kubernetes Reconciler Transition Table
@@ -64,35 +89,41 @@ flowchart TD
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
 | CRS not found | - | Object deleted before reconcile | Return nil (no-op) | - |
-| CRS without finalizer | Any | Object fetched | Add `addons.cluster.x-k8s.io` finalizer | CRS with finalizer |
-| CRS paused | Any | Paused annotation or spec | Set Paused condition, skip reconcile | Paused=True |
-| Selector invalid | ClusterSelector defined | Invalid label selector | Set ResourcesApplied=False (InternalError) | ResourcesApplied=False |
-| Selector empty | ClusterSelector={} | Empty selector | Return nil, no clusters matched | No change |
+| CRS without finalizer | Any | Object fetched | Add `addons.cluster.x-k8s.io` finalizer, return | CRS with finalizer |
+| CRS paused | Any | Paused annotation or Cluster paused | `EnsurePausedCondition` sets condition, skip reconcile | Paused=True |
+| Selector invalid | ClusterSelector defined | Invalid label selector | Set ResourcesApplied=False (InternalError), return error | ResourcesApplied=False, requeue with backoff |
+| Selector empty | ClusterSelector={} | Empty selector | Log info, return nil (no clusters matched) | No change |
 | DeletionTimestamp!=nil | - | User deletes CRS | Execute `reconcileDelete` | Finalizer removed, GC deletes |
 | Matching clusters exist | Resources defined | Normal reconcile | Call `ApplyClusterResourceSet` per cluster | ResourcesApplied condition updated |
+| Clusters with DeletionTimestamp | Resources defined | Cluster being deleted | Filter out deleting clusters | Continue with non-deleting clusters |
 
 ### ApplyClusterResourceSet Flow
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
-| Resource (Secret) wrong type | Resource defined | Secret.Type != `addons.cluster.x-k8s.io/resource-set` | Log error, set condition | ResourcesApplied=False (WrongSecretType) |
-| Resource not found | Resource defined | ConfigMap/Secret missing | Log warning, continue to next | Continue (partial application) |
+| Resource (Secret) wrong type | Resource defined | Secret.Type != `addons.cluster.x-k8s.io/resource-set` | Set condition, add to error list | ResourcesApplied=False (WrongSecretType) |
+| Resource not found | Resource defined | ConfigMap/Secret missing (IsNotFound) | Log warning, continue to next (best effort) | Continue (partial application) |
+| Resource retrieval error | Resource defined | Other Get error | Set condition (InternalError), add to error list | ResourcesApplied=False (InternalError) |
 | OwnerRef missing on resource | Resource exists | Resource without CRS OwnerRef | Patch resource to add OwnerRef | Resource has OwnerRef |
-| Binding not exists | Cluster matched | First CRS for this cluster | Create ClusterResourceSetBinding | Binding created |
+| Binding not exists | Cluster matched | First CRS for this cluster | Create ClusterResourceSetBinding with OwnerRef | Binding created |
 | Binding exists | Cluster matched | CRS already bound | Get existing binding | Binding reused |
-| Remote client unavailable | - | ClusterCache.GetClient fails | Set ResourcesApplied=False | ResourcesApplied=False (InternalError) |
-| K8s service not ready | - | Remote cluster <v1.25 | Wait for `kubernetes` Service in default ns | Continue after service exists |
+| Remote client unavailable | - | ClusterCache.GetClient fails | Set ResourcesApplied=False (InternalError) | ResourcesApplied=False, return error |
+| K8s service not ready | - | `kubernetes` Service not found in default ns | Return error, requeue | Retry on next reconcile |
 
 ### Resource Application (per resource)
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
+| Parse error | Any | `reconcileScopeForResource` fails (YAML parse, etc.) | Set Binding: Applied=false, Hash="", add to error list | ResourcesApplied=False |
 | Not applied (ApplyOnce) | strategy=ApplyOnce | `IsApplied(ref)` returns false | Create objects in workload cluster | Binding: Applied=true, Hash set |
 | Already applied (ApplyOnce) | strategy=ApplyOnce | `IsApplied(ref)` returns true | Skip (needsApply=false) | No change |
-| Hash unchanged (Reconcile) | strategy=Reconcile | Hash matches binding hash | Skip (needsApply=false) | No change |
-| Hash changed (Reconcile) | strategy=Reconcile | Hash differs from binding hash | Patch objects in workload cluster | Binding: Applied=true, new Hash |
+| Hash unchanged (Reconcile) | strategy=Reconcile | `Applied=true` AND Hash matches binding hash | Skip (needsApply=false) | No change |
+| Hash changed (Reconcile) | strategy=Reconcile | Hash differs OR `Applied=false` | Get+Patch objects in workload cluster | Binding: Applied=true, new Hash |
+| Not in binding (Reconcile) | strategy=Reconcile | `resourceBinding == nil` | Create/Patch objects | Binding: Applied=true, Hash set |
 | Object not exists (Reconcile) | strategy=Reconcile | Object not in workload cluster | Create object | Binding updated |
-| Apply fails | Any | Create/Patch error | Log error, set Applied=false | ResourcesApplied=False (NotApplied) |
+| Object exists (Reconcile) | strategy=Reconcile | Object in workload cluster | Patch object with MergeFrom | Binding updated |
+| Apply fails | Any | Create/Patch error | Log error, set Applied=false, add to error list | ResourcesApplied=False (NotApplied) |
+| Apply succeeds (all) | Any | No errors | Set ResourcesApplied=True | ResourcesApplied=True (Applied) |
 
 ### Deletion Reconciliation
 
@@ -108,13 +139,17 @@ flowchart TD
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
-| ClusterSelector parse error | ClusterSelector defined | Invalid selector syntax | Return error, set ResourcesApplied=False | ResourcesApplied=False (InternalError), Requeue with backoff |
-| ConfigMap/Secret not found | Resource defined | Missing resource | Log, continue (best effort) | Partial application |
+| ClusterSelector parse error | ClusterSelector defined | Invalid selector syntax | Return error, set ResourcesApplied=False (InternalError) | ResourcesApplied=False, Requeue with backoff |
+| ConfigMap/Secret not found | Resource defined | Missing resource (IsNotFound) | Log, continue to next (best effort) | Partial application |
 | Secret wrong type | Resource defined | Type != resource-set | Set condition, add to error list | ResourcesApplied=False (WrongSecretType) |
-| YAML parse error | Resource defined | Invalid YAML in ConfigMap/Secret | Add error, set Applied=false | ResourcesApplied=False |
-| Remote cluster unreachable | - | ClusterCache.GetClient fails | Set condition, return error | ResourcesApplied=False (InternalError), Requeue |
-| Binding patch conflict | - | Concurrent update by another CRS | Requeue after 100ms | Retry after fixed interval |
-| Apply object fails | Any | Create/Patch error on workload cluster | Log error, continue to next object | Partial application, Applied=false |
+| Resource retrieval error | Resource defined | Other Get error | Set condition (InternalError), add to error list | ResourcesApplied=False (InternalError) |
+| YAML/JSON parse error | Resource defined | Invalid YAML/JSON in ConfigMap/Secret | Set Applied=false, Hash="", add to error list | ResourcesApplied=False |
+| Remote cluster unreachable | - | ClusterCache.GetClient fails | Set condition (InternalError), return error | ResourcesApplied=False, Requeue |
+| K8s service not found | - | `kubernetes` Service missing | Return error | Requeue |
+| Binding patch conflict | - | Concurrent update by another CRS | Detect aggregate with single Conflict error | Requeue after 100ms (fixed interval) |
+| Apply object fails | Any | Create/Patch error on workload cluster | Log error, set Applied=false, continue to next resource | Partial application, ResourcesApplied=False |
+| Finalizer add error | Any | Patch fails when adding finalizer | Return error | Requeue with backoff |
+| OwnerRef patch fails | Any | Patch resource owner ref fails | Add to error list | Continue with errors |
 
 ## Strategy Types
 
@@ -125,17 +160,19 @@ The `ApplyOnce` strategy applies resources only once to a cluster. Even if the C
 ```mermaid
 flowchart TD
     A[reconcileApplyOnceScope.needsApply] --> B{IsApplied in Binding?}
-    B -->|Yes| C[Return false - Skip]
-    B -->|No| D[Return true - Apply]
+    B -->|Yes - Applied=true| C[Return false - Skip]
+    B -->|No - Applied=false/nil| D[Return true - Apply]
     D --> E[applyObj: Create only]
-    E --> F{Object exists?}
-    F -->|Yes - AlreadyExists| G[Ignore error, return nil]
-    F -->|No| H[Create object]
+    E --> F{Create result?}
+    F -->|AlreadyExists| G[Ignore error, return nil]
+    F -->|Success| H[Return nil]
+    F -->|Other Error| I[Return error]
 ```
 
 **Key characteristics:**
 - Checks `ResourceSetBinding.IsApplied(resourceRef)` - if `Applied=true`, skip
-- Uses `createUnstructured()` which only creates, ignores `AlreadyExists` errors
+- Uses `createUnstructured()` which only creates
+- Ignores `AlreadyExists` errors (idempotent)
 - Hash is stored but never used for comparison in this strategy
 
 ### Reconcile Strategy
@@ -144,25 +181,27 @@ The `Reconcile` strategy re-applies resources when their content changes, detect
 
 ```mermaid
 flowchart TD
-    A[reconcileStrategyScope.needsApply] --> B{Resource in Binding?}
-    B -->|No| C[Return true - Apply]
+    A[reconcileStrategyScope.needsApply] --> B{resourceBinding in Binding?}
+    B -->|No - nil| C[Return true - Apply]
     B -->|Yes| D{Applied=true?}
-    D -->|No| E[Return true - Apply]
-    D -->|Yes| F{Hash matches?}
+    D -->|No - false or nil| E[Return true - Apply]
+    D -->|Yes - true| F{Hash matches?}
     F -->|Yes| G[Return false - Skip]
     F -->|No| H[Return true - Apply]
     C --> I[applyObj: Get then Create/Patch]
     E --> I
     H --> I
     I --> J{Object exists?}
-    J -->|No| K[Create object]
+    J -->|No - IsNotFound| K[Create object]
     J -->|Yes| L[Patch object with MergeFrom]
+    J -->|Error| M[Return error]
 ```
 
 **Key characteristics:**
 - Checks: `resourceBinding == nil || !Applied || Hash != computedHash`
-- Uses `Get` + `Patch` (MergeFrom) for existing objects
+- Uses `Get` then `Create` (if not found) or `Patch` (MergeFrom) for existing objects
 - Updates hash in binding after successful apply
+- ResourceVersion is set before patching to prevent conflicts
 
 ## ClusterResourceSetBinding
 
@@ -285,10 +324,22 @@ The hash is deterministic because:
 | Condition | Status | Reason | Description |
 |-----------|--------|--------|-------------|
 | `ResourcesApplied` | True | `Applied` | All resources successfully applied to all matching clusters |
-| `ResourcesApplied` | False | `NotApplied` | Failed to apply at least one resource |
-| `ResourcesApplied` | False | `WrongSecretType` | Secret type is not supported |
-| `ResourcesApplied` | False | `InternalError` | Unexpected failure (selector parse, client error, etc.) |
-| `Paused` | True | - | ClusterResourceSet is paused |
+| `ResourcesApplied` | False | `NotApplied` | Failed to apply at least one resource to at least one cluster |
+| `ResourcesApplied` | False | `WrongSecretType` | Secret type is not `addons.cluster.x-k8s.io/resource-set` |
+| `ResourcesApplied` | False | `InternalError` | Unexpected failure (selector parse, client error, resource retrieval error, etc.) |
+| `Paused` | True | `Paused` | ClusterResourceSet is paused (via annotation or Cluster paused) |
+| `Paused` | False | `NotPaused` | ClusterResourceSet is not paused |
+
+### V1Beta1 Conditions (Legacy/Deprecated)
+
+| Condition | Status | Reason | Description |
+|-----------|--------|--------|-------------|
+| `ResourcesApplied` | True | (no reason) | All resources successfully applied |
+| `ResourcesApplied` | False | `ClusterMatchFailed` | Failed to match clusters with selector |
+| `ResourcesApplied` | False | `WrongSecretType` | Secret type not supported |
+| `ResourcesApplied` | False | `RetrievingResourceFailed` | Failed to get resource |
+| `ResourcesApplied` | False | `RemoteClusterClientFailed` | Failed to get remote cluster client |
+| `ResourcesApplied` | False | `ApplyFailed` | Failed to apply resource to cluster |
 
 ## Cluster Selection
 
@@ -340,13 +391,13 @@ spec:
 
 The ClusterResourceSet controller watches:
 
-| Resource | Watch Type | Handler | Purpose |
-|----------|------------|---------|---------|
-| `ClusterResourceSet` | Primary | Reconcile | Main reconciliation trigger |
-| `Cluster` | Watch | `clusterToClusterResourceSet` | Trigger when cluster labels change or new cluster created |
-| `ClusterCache` | RawSource | `clusterToClusterResourceSet` | Trigger when workload cluster connection changes |
-| `ConfigMap` | WatchesMetadata | `resourceToClusterResourceSetFunc` | Trigger when ConfigMap created/updated |
-| `Secret` | RawSource (partial cache) | `resourceToClusterResourceSetFunc` | Trigger when Secret created/updated |
+| Resource | Watch Type | Handler | Predicate | Purpose |
+|----------|------------|---------|-----------|---------|
+| `ClusterResourceSet` | For (Primary) | Reconcile | ResourceHasFilterLabel | Main reconciliation trigger |
+| `Cluster` | Watches | `clusterToClusterResourceSet` | ResourceHasFilterLabel | Trigger when cluster labels change or new cluster created |
+| `ClusterCache` | WatchesRawSource | `clusterToClusterResourceSet` | - | Trigger when workload cluster connection changes |
+| `ConfigMap` | WatchesMetadata | `resourceToClusterResourceSetFunc` | ResourceCreateOrUpdate | Trigger when ConfigMap created/updated |
+| `Secret` | WatchesRawSource (partialSecretCache) | `resourceToClusterResourceSetFunc` | ResourceIsChanged + ResourceCreateOrUpdate | Trigger when Secret created/updated |
 
 ### Mapper Functions
 

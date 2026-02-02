@@ -6,33 +6,36 @@ The MachinePool Controller manages `MachinePool` resources, which represent a po
 
 ```mermaid
 flowchart TB
-    subgraph "MachinePool Controller"
+    subgraph \"MachinePool Controller\"
         R[Reconcile] --> F{Fetch MachinePool}
-        F -->|Not Found| End[Return]
-        F -->|Found| Fin[Add Finalizer]
-        Fin --> GC[Get Cluster]
-        GC --> P{Paused?}
-        P -->|Yes| PC[Set Paused Condition & Return]
-        P -->|No| D{Deleting?}
+        F -->|Not Found| End[Return nil]
+        F -->|Error| Err[Return error]
+        F -->|Found| Fin{EnsureFinalizer}
+        Fin -->|Added/Error| FinRet[Return]
+        Fin -->|Already has| GC[Get Cluster]
+        GC -->|Error| GCE[Return error]
+        GC --> P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| D{Deleting?}
         D -->|Yes| RD[reconcileDelete]
         D -->|No| RN[reconcileNormal]
     end
     
-    subgraph "Always Reconcile"
-        OL[reconcileSetOwnerAndLabels]
+    subgraph \"Always Reconcile\"
+        OL[reconcileSetOwnerAndLabels - set Cluster owner]
     end
     
-    subgraph "Normal Phases"
-        RB[reconcileBootstrap]
-        RI[reconcileInfrastructure]
-        GM[getMachinesForMachinePool]
-        RN2[reconcileNodeRefs]
-        SMU[setMachinesUptoDate]
+    subgraph \"Normal Phases\"
+        RB[reconcileBootstrap - get config, set owner]
+        RI[reconcileInfrastructure - get infra, set owner]
+        GM[getMachinesForMachinePool - list machines by label]
+        RN2[reconcileNodeRefs - associate nodes via ProviderID]
+        SMU[setMachinesUptoDate - check machine spec match]
     end
     
-    subgraph "Delete Phases"
-        DE[Delete External References]
-        DN[Delete Nodes]
+    subgraph \"Delete Phases\"
+        DE[Delete Bootstrap + Infrastructure objects]
+        DN[Delete Nodes from workload cluster]
         RF[Remove Finalizer]
     end
     

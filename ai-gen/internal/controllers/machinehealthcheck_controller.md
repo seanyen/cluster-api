@@ -8,24 +8,26 @@ The MachineHealthCheck Controller monitors the health of machines and triggers r
 flowchart TB
     subgraph "MachineHealthCheck Controller"
         R[Reconcile] --> F{Fetch MHC}
-        F -->|Not Found| End[Return]
+        F -->|Not Found| End[Return nil]
+        F -->|Error| Err[Return error]
         F -->|Found| GC[Get Cluster]
-        GC --> P{Paused?}
-        P -->|Yes| PC[Set Paused Condition & Return]
-        P -->|No| RN[reconcile]
+        GC -->|Error| GCE[Return error]
+        GC --> P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| SO[setOwnerReference to Cluster]
+        SO --> RN[reconcile]
     end
     
-    subgraph "Reconcile Flow"
-        SO[Set Owner Reference]
-        GT[Get Targets]
-        HC[Health Check Targets]
-        CR{Check Remediation Allowed}
-        REM[Remediate Unhealthy]
+    subgraph \"Reconcile Flow\"
+        GT[Get Target Machines via label selector]
+        HC[healthCheck Targets - check each machine]
+        CR{Check Remediation Allowed via triggerIf}
+        REM[Remediate Unhealthy machines]
     end
     
-    RN --> SO --> GT --> HC --> CR
+    RN --> GT --> HC --> CR
     CR -->|Allowed| REM
-    CR -->|Not Allowed| SC[Short Circuit]
+    CR -->|Not Allowed| SC[Short Circuit - set RemediationAllowed=False]
 ```
 
 ## Health Checking Flow
@@ -117,43 +119,59 @@ spec:
     matchLabels:
       cluster.x-k8s.io/deployment-name: my-deployment
   
-  # Node startup timeout (v1beta2 structure)
-  nodeStartupTimeout: 5m
+  # Checks configuration (v1beta2 structure)
+  checks:
+    # Node startup timeout - defaults to 10 minutes, set to 0 to disable
+    nodeStartupTimeoutSeconds: 600
+    
+    # Unhealthy node conditions to check
+    unhealthyNodeConditions:
+      - type: Ready
+        status: "False"
+        unhealthyTimeoutSeconds: 300
+      - type: Ready
+        status: "Unknown"
+        unhealthyTimeoutSeconds: 300
+    
+    # Unhealthy machine conditions to check
+    unhealthyMachineConditions:
+      - type: Ready
+        status: "False"
+        unhealthyTimeoutSeconds: 300
   
-  # Unhealthy conditions to check
-  unhealthyConditions:
-    - type: Ready
-      status: "False"
-      timeout: 5m
-    - type: Ready
-      status: "Unknown"
-      timeout: 5m
-  
-  # Remediation threshold using triggerIf
-  triggerIf:
-    unhealthyLessThanOrEqualTo: "100%"  # Short-circuit threshold
-    # OR use unhealthyInRange for range-based threshold
-    # unhealthyInRange: "0-40%"
-  
-  # Optional: External remediation template
-  remediationTemplate:
-    apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
-    kind: MyRemediationTemplate
-    name: my-remediation-template
+  # Remediation configuration
+  remediation:
+    # triggerIf configures when remediations are triggered
+    triggerIf:
+      # unhealthyLessThanOrEqualTo: remediations only if unhealthy count <= value
+      unhealthyLessThanOrEqualTo: "100%"
+      # OR use unhealthyInRange for range-based threshold (takes precedence)
+      # unhealthyInRange: "[3-5]"  # Remediate only when 3-5 machines are unhealthy
+    
+    # Optional: External remediation template
+    templateRef:
+      kind: MyRemediationTemplate
+      apiVersion: infrastructure.cluster.x-k8s.io/v1beta2
+      name: my-remediation-template
 ```
 
-## MaxUnhealthy Calculation
+## TriggerIf Calculation
 
 ```mermaid
 flowchart TD
-    A[Get Total Targets] --> B{MaxUnhealthy Type}
-    B -->|Integer| C[Use Direct Value]
-    B -->|Percentage| D[Calculate: Total * Percentage]
-    C --> E[Compare Unhealthy Count]
-    D --> E
-    E --> F{Unhealthy > MaxUnhealthy?}
-    F -->|Yes| G[Short Circuit]
-    F -->|No| H[Allow Remediation]
+    A[Get Total Targets] --> B{TriggerIf Set?}
+    B -->|No| H[Always Allow Remediation]
+    B -->|Yes| C{UnhealthyInRange Set?}
+    C -->|Yes| D[Check if Unhealthy in Range]
+    C -->|No| E{UnhealthyLessThanOrEqualTo Set?}
+    E -->|Yes| F[Check if Unhealthy <= Threshold]
+    E -->|No| H
+    D --> G{Within Range?}
+    G -->|Yes| H[Allow Remediation]
+    G -->|No| I[Block Remediation]
+    F --> J{Below Threshold?}
+    J -->|Yes| H
+    J -->|No| I
 ```
 
 ## External Remediation

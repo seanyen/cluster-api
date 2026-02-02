@@ -8,34 +8,43 @@ The Cluster Controller manages the lifecycle of `Cluster` resources, coordinatin
 flowchart TB
     subgraph "Cluster Controller"
         R[Reconcile] --> F{Fetch Cluster}
-        F -->|Not Found| End[Return]
-        F -->|Found| Fin[Add Finalizer]
-        Fin --> P{Paused?}
-        P -->|Yes| PC[Set Paused Condition & Return]
-        P -->|No| CLS{ClusterClass Defined?}
-        CLS -->|Yes & Refs Missing| WT[Wait for Topology Generation]
+        F -->|Not Found| End[Return nil]
+        F -->|Error| Err[Return error]
+        F -->|Found| Fin{EnsureFinalizer}
+        Fin -->|Added/Error| FinRet[Return]
+        Fin -->|Already has| P{EnsurePausedCondition}
+        P -->|Paused/Requeue/Error| PC[Return]
+        P -->|Not Paused| CC{Get ClusterClass}
+        CC -->|Error| CCE[Return error]
+        CC --> CLS{Topology Defined?}
+        CLS -->|Yes & Refs Missing| WT[Wait for Topology Generation<br/>Return nil]
         CLS -->|No or Refs Ready| D{Deleting?}
         D -->|Yes| RD[reconcileDelete]
         D -->|No| RN[reconcileNormal]
     end
     
-    subgraph "Always Reconcile Phases"
+    subgraph "Always Reconcile Phases (both delete and normal)"
         I[reconcileInfrastructure]
         CP[reconcileControlPlane]
         GD[getDescendants]
     end
     
-    subgraph "Normal Reconcile"
+    subgraph "Normal Reconcile (after always phases)"
         K[reconcileKubeconfig]
         CPI[reconcileV1Beta1ControlPlaneInitialized]
     end
     
-    subgraph "Delete Reconcile"
-        HOOK{BeforeClusterDelete Hook?}
+    subgraph "Delete Reconcile (after always phases)"
+        HOOK{BeforeClusterDelete Hook?<br/>RuntimeSDK + ClusterTopology}
         DC[Delete Children]
         DCP[Delete Control Plane]
         DI[Delete Infrastructure]
         RF[Remove Finalizer]
+    end
+    
+    subgraph "Defer: updateStatus + patchCluster"
+        US[updateStatus: phase, conditions, replicas]
+        PC2[patchCluster with owned conditions]
     end
     
     RN --> I --> CP --> GD --> K --> CPI
@@ -96,30 +105,47 @@ Handles cluster deletion with proper ordering. The controller follows a strict d
 4. Delete Infrastructure object
 5. Remove finalizer
 
+**Note:** The `deletingReason` and `deletingMessage` are stored in the scope and used later by `setDeletingCondition` in `updateStatus`.
+
 ```mermaid
 flowchart TD
-    A[Start] --> B{RuntimeSDK + ClusterTopology?}
+    A[Start] --> B{RuntimeSDK + ClusterTopology enabled?}
     B -->|Yes| C{Cluster has managed topology?}
-    C -->|Yes| D{ok-to-delete annotation?}
-    D -->|No| E[Set Deleting: WaitingForBeforeDeleteHook]
+    C -->|Yes| D{hooks.IsOkToDelete?}
+    D -->|No| E[deletingReason: WaitingForBeforeDeleteHook<br/>Return]
     D -->|Yes| F[Continue]
     C -->|No| F
     B -->|No| F
-    F --> G{getDescendants succeeded?}
-    G -->|No| H[Set Deleting: InternalError]
-    G -->|Yes| I{Has descendant children?}
-    I -->|Yes| J[Delete owned children]
-    J --> K{Descendants pending delete?}
-    K -->|Yes| L[Set Deleting: WaitingForWorkersDeletion]
-    K -->|No| M{ControlPlaneRef defined?}
-    I -->|No| M
-    M -->|Yes & CP exists| N[Delete ControlPlane]
-    N --> O[Set Deleting: WaitingForControlPlaneDeletion]
-    M -->|No or CP deleted| P{InfrastructureRef defined?}
-    P -->|Yes & Infra exists| Q[Delete Infrastructure]
-    Q --> R[Set Deleting: WaitingForInfrastructureDeletion]
-    P -->|No or Infra deleted| S[Set Deleting: DeletionCompleted]
-    S --> T[Remove Finalizer]
+    F --> G{getDescendantsSucceeded?}
+    G -->|No| H[deletingReason: InternalError<br/>Return]
+    G -->|Yes| I[filterOwnedDescendants]
+    I --> J{Has owned children?}
+    J -->|Yes| K[Delete children not already deleting]
+    K --> L{Delete errors?}
+    L -->|Yes| LE[deletingReason: InternalError<br/>Return error]
+    L -->|No| M{objectsPendingDeleteCount > 0?}
+    M -->|Yes| N[deletingReason: WaitingForWorkersDeletion<br/>Requeue after 5s]
+    J -->|No| O{ControlPlaneRef defined?}
+    M -->|No| O
+    O -->|Yes| P{controlPlane == nil?}
+    P -->|Yes & IsNotFound| Q[Mark ControlPlaneReady: Deleted]
+    P -->|No - exists| R{DeletionTimestamp.IsZero?}
+    R -->|Yes| S[Delete ControlPlane]
+    S --> T[deletingReason: WaitingForControlPlaneDeletion<br/>Return]
+    R -->|No| T
+    Q --> U{InfrastructureRef defined?}
+    P -->|Error not IsNotFound| V[deletingReason: InternalError<br/>Return]
+    O -->|No| U
+    U -->|Yes| W{infraCluster == nil?}
+    W -->|Yes & IsNotFound| X[Mark InfraReady: Deleted]
+    W -->|No - exists| Y{DeletionTimestamp.IsZero?}
+    Y -->|Yes| Z[Delete Infrastructure]
+    Z --> AA[deletingReason: WaitingForInfrastructureDeletion<br/>Return]
+    Y -->|No| AA
+    X --> AB[deletingReason: DeletionCompleted]
+    U -->|No| AB
+    W -->|Error not IsNotFound| AC[deletingReason: InternalError<br/>Return]
+    AB --> AD[Remove Finalizer]
 ```
 
 ## KRTT - Kubernetes Reconciler Transition Table
@@ -128,33 +154,45 @@ flowchart TD
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
-| Phase=Pending, No InfraRef | InfraRef not defined | Initial creation | Skip infra reconciliation, mark InfrastructureProvisioned=true | Phase=Provisioning |
-| Phase=Pending | InfraRef defined | Initial creation | Get/create infrastructure object, set owner reference | Phase=Provisioning, InfrastructureReady=False |
-| InfrastructureReady=False | InfraRef defined | Infra object created | Watch infra object, wait for provisioned=true | No change, requeue |
-| InfrastructureReady=False | InfraRef defined | Infra reports provisioned=true | Copy ControlPlaneEndpoint, FailureDomains to Cluster | InfrastructureProvisioned=True |
-| ControlPlaneReady=False | ControlPlaneRef defined | Infra ready | Get/create control plane object, set owner reference | ControlPlaneReady condition mirrors CP |
-| ControlPlaneReady=False | ControlPlaneRef defined | CP reports initialized=true | Copy ControlPlaneEndpoint to Cluster | ControlPlaneInitialized=True |
-| ControlPlaneReady=True | Valid endpoint | CP initialized, no Kubeconfig | Generate Kubeconfig secret (if no CP ref) | Kubeconfig secret created |
-| Phase=Provisioning | All refs ready | Infra provisioned + endpoint valid | Update phase | Phase=Provisioned |
+| Cluster not found | - | Object deleted | Return nil (no-op) | - |
+| Cluster without finalizer | Any | Object fetched | Add `cluster.cluster.x-k8s.io` finalizer, return | Cluster with finalizer |
+| Cluster paused | Any | Paused annotation or spec | `EnsurePausedCondition` sets condition | Paused=True |
+| Topology defined, refs missing | Topology defined | Initial with ClusterClass | Log and return nil (wait for topology controller) | No change |
+| Phase=Pending, No InfraRef | InfraRef not defined | No infra template | Mark InfrastructureProvisioned=true, V1Beta1 InfrastructureReady=True | Phase=Provisioning |
+| Phase=Pending | InfraRef defined | Initial creation | Get infra object, set owner ref + cluster label | InfrastructureReady mirrors infra |
+| InfrastructureReady=False | InfraRef defined | Infra not found (not deleting) | Requeue after 30s | No change |
+| InfrastructureReady=False | InfraRef defined | Infra provisioned=true | Copy ControlPlaneEndpoint, FailureDomains | InfrastructureProvisioned=True |
+| ControlPlaneRef defined | ControlPlaneRef defined | CP not found (not deleting) | Requeue after 30s | ControlPlaneReady=False |
+| ControlPlaneRef defined | ControlPlaneRef defined | CP initialized=true | Copy ControlPlaneEndpoint | ControlPlaneInitialized=True |
+| No ControlPlaneRef | Endpoint valid | CP initialized, no Kubeconfig secret | Generate Kubeconfig secret | Kubeconfig created |
+| No ControlPlaneRef | - | No CP ref, active machines | Check for control plane machine with NodeRef | ControlPlaneInitialized=True when found |
+| Phase=Provisioning | All ready | Infra provisioned + CP initialized | setPhase | Phase=Provisioned |
 
 ### Deletion Reconciliation
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
-| DeletionTimestamp!=nil | - | User deletes Cluster | Check BeforeClusterDelete hook (if RuntimeSDK) | Deleting condition set |
-| Has descendants | - | Children exist | Delete owned MachineDeployments, MachineSets, Machines | Requeue after 5s |
-| No worker descendants | ControlPlaneRef exists | CP still present | Delete ControlPlane object | Wait for CP deletion |
-| No CP | InfraRef exists | Infra still present | Delete Infrastructure object | Wait for Infra deletion |
-| No CP, No Infra | - | All children gone | Remove finalizer | Object deleted by GC |
+| DeletionTimestamp!=nil | - | User deletes Cluster | Run alwaysReconcile phases first | Deleting condition pending |
+| RuntimeSDK + ClusterTopology | Managed topology | ok-to-delete annotation missing | Set deletingReason: WaitingForBeforeDeleteHook | Deleting=WaitingForBeforeDeleteHook |
+| getDescendants failed | - | Error listing descendants | Set deletingReason: InternalError, return | Deleting=InternalError |
+| Has owned descendants | - | Children exist | Delete owned (MD, MS, Machines, MP) not already deleting | Continue cleanup |
+| objectsPendingDeleteCount > 0 | - | Descendants still deleting | Set deletingReason: WaitingForWorkersDeletion | Deleting=WaitingForWorkersDeletion, Requeue 5s |
+| No descendants | ControlPlaneRef defined | CP still exists | Delete ControlPlane, set deletingReason: WaitingForControlPlaneDeletion | Deleting=WaitingForControlPlaneDeletion |
+| CP deleted/not found | InfrastructureRef defined | Infra still exists | Delete Infrastructure, set deletingReason: WaitingForInfrastructureDeletion | Deleting=WaitingForInfrastructureDeletion |
+| CP & Infra gone | - | All cleanup done | Set deletingReason: DeletionCompleted, remove finalizer | Object deleted by GC |
 
 ### Error Handling
 
 | Observed Status | Desired Spec | Trigger / Condition | Reconciliation Action | Resulting Status |
 |:---|:---|:---|:---|:---|
-| InfrastructureProvisioned=true | InfraRef defined | Infra object not found | Return error - infra deleted after provisioned | Error logged |
-| ControlPlaneInitialized=true | CPRef defined | CP object not found | Return error - CP deleted after initialized | Error logged |
+| Finalizer add failed | Any | Patch error | Return error | Requeue with backoff |
+| ClusterClass fetch failed | Topology defined | ClusterClass not found/error | Return error | Requeue with backoff |
+| InfrastructureProvisioned=true | InfraRef defined | Infra object not found (not deleting) | Return error - "deleted after being provisioned" | Error logged, requeue |
+| ControlPlaneInitialized=true | CPRef defined | CP object not found (not deleting) | Return error - "deleted after being initialized" | Error logged, requeue |
+| Any | - | External object fetch error | Requeue after 30s (if not found) or error | Condition reflects state |
 | Any | - | Generic API error | Requeue with error | Error logged, requeue |
-| Any | - | Object paused | Set Paused condition, return | Paused=True |
+| Deleting | - | filterOwnedDescendants error | Set deletingReason: InternalError | Deleting=InternalError |
+| Deleting | - | Delete child error | Set deletingReason: InternalError, return error | Deleting=InternalError, requeue |
 
 ## Status Fields
 
