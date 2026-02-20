@@ -48,7 +48,6 @@ import (
 	"sigs.k8s.io/cluster-api/controlplane/kubeadm/internal"
 	runtimeclient "sigs.k8s.io/cluster-api/exp/runtime/client"
 	"sigs.k8s.io/cluster-api/feature"
-	capicontrollerutil "sigs.k8s.io/cluster-api/internal/util/controller"
 	"sigs.k8s.io/cluster-api/internal/util/inplace"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util"
@@ -56,6 +55,7 @@ import (
 	"sigs.k8s.io/cluster-api/util/collections"
 	"sigs.k8s.io/cluster-api/util/conditions"
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+	capicontrollerutil "sigs.k8s.io/cluster-api/util/controller"
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	clog "sigs.k8s.io/cluster-api/util/log"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -444,13 +444,17 @@ func (r *KubeadmControlPlaneReconciler) reconcile(ctx context.Context, controlPl
 		return result, err
 	}
 
-	if err := r.syncMachines(ctx, controlPlane); err != nil {
+	stopReconcile, err := r.syncMachines(ctx, controlPlane)
+	if err != nil {
 		// Note: If any of the calls got a NotFound error, it means that at least one Machine got deleted.
 		// Let's return here so that the next Reconcile will get the updated list of Machines.
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil // Note: Requeue is not needed, changes to Machines trigger another reconcile.
 		}
 		return ctrl.Result{}, errors.Wrap(err, "failed to sync Machines")
+	}
+	if stopReconcile {
+		return ctrl.Result{RequeueAfter: 1 * time.Second}, nil // Explicitly requeue as we are not watching for changes to BootstrapConfig and InfraMachine objects.
 	}
 
 	// Aggregate the operational state of all the machines; while aggregating we are adding the
@@ -845,8 +849,9 @@ func (r *KubeadmControlPlaneReconciler) ClusterToKubeadmControlPlane(_ context.C
 }
 
 // syncMachines updates Machines, InfrastructureMachines and KubeadmConfigs to propagate in-place mutable fields from KCP.
-func (r *KubeadmControlPlaneReconciler) syncMachines(ctx context.Context, controlPlane *internal.ControlPlane) error {
+func (r *KubeadmControlPlaneReconciler) syncMachines(ctx context.Context, controlPlane *internal.ControlPlane) (bool, error) {
 	patchHelpers := map[string]*patch.Helper{}
+	var anyManagedFieldIssueMitigated bool
 	for machineName := range controlPlane.Machines {
 		m := controlPlane.Machines[machineName]
 		// If the Machine is already being deleted, we only need to sync
@@ -854,69 +859,84 @@ func (r *KubeadmControlPlaneReconciler) syncMachines(ctx context.Context, contro
 		if !m.DeletionTimestamp.IsZero() {
 			patchHelper, err := patch.NewHelper(m, r.Client)
 			if err != nil {
-				return err
+				return false, err
 			}
 
 			// Set all other in-place mutable fields that impact the ability to tear down existing machines.
 			m.Spec.Deletion.NodeDrainTimeoutSeconds = controlPlane.KCP.Spec.MachineTemplate.Spec.Deletion.NodeDrainTimeoutSeconds
 			m.Spec.Deletion.NodeDeletionTimeoutSeconds = controlPlane.KCP.Spec.MachineTemplate.Spec.Deletion.NodeDeletionTimeoutSeconds
 			m.Spec.Deletion.NodeVolumeDetachTimeoutSeconds = controlPlane.KCP.Spec.MachineTemplate.Spec.Deletion.NodeVolumeDetachTimeoutSeconds
+			m.Spec.Taints = controlPlane.KCP.Spec.MachineTemplate.Spec.Taints
 
 			// Note: We intentionally don't set "minReadySeconds" on Machines because we consider it enough to have machine availability driven by readiness of control plane components.
 			if err := patchHelper.Patch(ctx, m); err != nil {
-				return err
+				return false, err
 			}
 
 			controlPlane.Machines[machineName] = m
 			patchHelper, err = patch.NewHelper(m, r.Client)
 			if err != nil {
-				return err
+				return false, err
 			}
 			patchHelpers[machineName] = patchHelper
 			continue
 		}
 
-		// Update Machine to propagate in-place mutable fields from KCP.
-		updatedMachine, err := r.updateMachine(ctx, m, controlPlane.KCP, controlPlane.Cluster)
+		managedFieldIssueMitigated, err := ssa.MitigateManagedFieldsIssue(ctx, r.Client, m, kcpManagerName)
 		if err != nil {
-			return errors.Wrapf(err, "failed to update Machine: %s", klog.KObj(m))
+			return false, err
 		}
-		// Note: Ensure ControlPlane has the latest version of the Machine. This is required because
-		//       e.g. the in-place update code that is called later has to use the latest version of the Machine.
-		controlPlane.Machines[machineName] = updatedMachine
-		if _, ok := controlPlane.MachinesNotUpToDate[machineName]; ok {
-			controlPlane.MachinesNotUpToDate[machineName] = updatedMachine
+		anyManagedFieldIssueMitigated = anyManagedFieldIssueMitigated || managedFieldIssueMitigated
+		if !anyManagedFieldIssueMitigated {
+			// Update Machine to propagate in-place mutable fields from KCP.
+			updatedMachine, err := r.updateMachine(ctx, m, controlPlane.KCP, controlPlane.Cluster)
+			if err != nil {
+				return false, errors.Wrapf(err, "failed to update Machine: %s", klog.KObj(m))
+			}
+			// Note: Ensure ControlPlane has the latest version of the Machine. This is required because
+			//       e.g. the in-place update code that is called later has to use the latest version of the Machine.
+			controlPlane.Machines[machineName] = updatedMachine
+			if _, ok := controlPlane.MachinesNotUpToDate[machineName]; ok {
+				controlPlane.MachinesNotUpToDate[machineName] = updatedMachine
+			}
+			// Since the machine is updated, re-create the patch helper so that any subsequent
+			// Patch calls use the correct base machine object to calculate the diffs.
+			// Example: reconcileControlPlaneAndMachinesConditions patches the machine objects in a subsequent call
+			// and, it should use the updated machine to calculate the diff.
+			// Note: If the patchHelpers are not re-computed based on the new updated machines, subsequent
+			// Patch calls will fail because the patch will be calculated based on an outdated machine and will error
+			// because of outdated resourceVersion.
+			// TODO: This should be cleaned-up to have a more streamline way of constructing and using patchHelpers.
+			patchHelper, err := patch.NewHelper(updatedMachine, r.Client)
+			if err != nil {
+				return false, err
+			}
+			patchHelpers[machineName] = patchHelper
 		}
-		// Since the machine is updated, re-create the patch helper so that any subsequent
-		// Patch calls use the correct base machine object to calculate the diffs.
-		// Example: reconcileControlPlaneAndMachinesConditions patches the machine objects in a subsequent call
-		// and, it should use the updated machine to calculate the diff.
-		// Note: If the patchHelpers are not re-computed based on the new updated machines, subsequent
-		// Patch calls will fail because the patch will be calculated based on an outdated machine and will error
-		// because of outdated resourceVersion.
-		// TODO: This should be cleaned-up to have a more streamline way of constructing and using patchHelpers.
-		patchHelper, err := patch.NewHelper(updatedMachine, r.Client)
-		if err != nil {
-			return err
-		}
-		patchHelpers[machineName] = patchHelper
 
 		infraMachine, infraMachineFound := controlPlane.InfraResources[machineName]
 		// Only update the InfraMachine if it is already found, otherwise just skip it.
 		// This could happen e.g. if the cache is not up-to-date yet.
 		if infraMachineFound {
-			// Drop managedFields for manager:Update and capi-kubeadmcontrolplane:Apply for all objects created with CAPI <= v1.11.
-			// Starting with CAPI v1.12 we have a new managedField structure where capi-kubeadmcontrolplane-metadata will own
-			// labels and annotations and capi-kubeadmcontrolplane everything else.
-			// Note: We have to call ssa.MigrateManagedFields for every Machine created with CAPI <= v1.11 once.
-			//       Given that this was introduced in CAPI v1.12 and our n-3 upgrade policy this can
-			//       be removed with CAPI v1.15.
-			if err := ssa.MigrateManagedFields(ctx, r.Client, infraMachine, kcpManagerName, kcpMetadataManagerName); err != nil {
-				return errors.Wrapf(err, "failed to clean up managedFields of InfrastructureMachine %s", klog.KObj(infraMachine))
+			managedFieldIssueMitigated, err = ssa.MitigateManagedFieldsIssue(ctx, r.Client, infraMachine, kcpMetadataManagerName)
+			if err != nil {
+				return false, err
 			}
-			// Update in-place mutating fields on InfrastructureMachine.
-			if err := r.updateLabelsAndAnnotations(ctx, infraMachine, infraMachine.GroupVersionKind(), controlPlane.KCP, controlPlane.Cluster); err != nil {
-				return errors.Wrapf(err, "failed to update InfrastructureMachine %s", klog.KObj(infraMachine))
+			anyManagedFieldIssueMitigated = anyManagedFieldIssueMitigated || managedFieldIssueMitigated
+			if !anyManagedFieldIssueMitigated {
+				// Drop managedFields for manager:Update and capi-kubeadmcontrolplane:Apply for all objects created with CAPI <= v1.11.
+				// Starting with CAPI v1.12 we have a new managedField structure where capi-kubeadmcontrolplane-metadata will own
+				// labels and annotations and capi-kubeadmcontrolplane everything else.
+				// Note: We have to call ssa.MigrateManagedFields for every Machine created with CAPI <= v1.11 once.
+				//       Given that this was introduced in CAPI v1.12 and our n-3 upgrade policy this can
+				//       be removed with CAPI v1.15.
+				if err := ssa.MigrateManagedFields(ctx, r.Client, infraMachine, kcpManagerName, kcpMetadataManagerName); err != nil {
+					return false, errors.Wrapf(err, "failed to clean up managedFields of InfrastructureMachine %s", klog.KObj(infraMachine))
+				}
+				// Update in-place mutating fields on InfrastructureMachine.
+				if err := r.updateLabelsAndAnnotations(ctx, infraMachine, infraMachine.GroupVersionKind(), controlPlane.KCP, controlPlane.Cluster); err != nil {
+					return false, errors.Wrapf(err, "failed to update InfrastructureMachine %s", klog.KObj(infraMachine))
+				}
 			}
 		}
 
@@ -924,24 +944,31 @@ func (r *KubeadmControlPlaneReconciler) syncMachines(ctx context.Context, contro
 		// Only update the KubeadmConfig if it is already found, otherwise just skip it.
 		// This could happen e.g. if the cache is not up-to-date yet.
 		if kubeadmConfigFound {
-			// Drop managedFields for manager:Update and capi-kubeadmcontrolplane:Apply for all objects created with CAPI <= v1.11.
-			// Starting with CAPI v1.12 we have a new managedField structure where capi-kubeadmcontrolplane-metadata will own
-			// labels and annotations and capi-kubeadmcontrolplane everything else.
-			// Note: We have to call ssa.MigrateManagedFields for every Machine created with CAPI <= v1.11 once.
-			//       Given that this was introduced in CAPI v1.12 and our n-3 upgrade policy this can
-			//       be removed with CAPI v1.15.
-			if err := ssa.MigrateManagedFields(ctx, r.Client, kubeadmConfig, kcpManagerName, kcpMetadataManagerName); err != nil {
-				return errors.Wrapf(err, "failed to clean up managedFields of KubeadmConfig %s", klog.KObj(kubeadmConfig))
+			managedFieldIssueMitigated, err = ssa.MitigateManagedFieldsIssue(ctx, r.Client, kubeadmConfig, kcpMetadataManagerName)
+			if err != nil {
+				return false, err
 			}
-			// Update in-place mutating fields on BootstrapConfig.
-			if err := r.updateLabelsAndAnnotations(ctx, kubeadmConfig, bootstrapv1.GroupVersion.WithKind("KubeadmConfig"), controlPlane.KCP, controlPlane.Cluster); err != nil {
-				return errors.Wrapf(err, "failed to update KubeadmConfig %s", klog.KObj(kubeadmConfig))
+			anyManagedFieldIssueMitigated = anyManagedFieldIssueMitigated || managedFieldIssueMitigated
+			if !anyManagedFieldIssueMitigated {
+				// Drop managedFields for manager:Update and capi-kubeadmcontrolplane:Apply for all objects created with CAPI <= v1.11.
+				// Starting with CAPI v1.12 we have a new managedField structure where capi-kubeadmcontrolplane-metadata will own
+				// labels and annotations and capi-kubeadmcontrolplane everything else.
+				// Note: We have to call ssa.MigrateManagedFields for every Machine created with CAPI <= v1.11 once.
+				//       Given that this was introduced in CAPI v1.12 and our n-3 upgrade policy this can
+				//       be removed with CAPI v1.15.
+				if err := ssa.MigrateManagedFields(ctx, r.Client, kubeadmConfig, kcpManagerName, kcpMetadataManagerName); err != nil {
+					return false, errors.Wrapf(err, "failed to clean up managedFields of KubeadmConfig %s", klog.KObj(kubeadmConfig))
+				}
+				// Update in-place mutating fields on BootstrapConfig.
+				if err := r.updateLabelsAndAnnotations(ctx, kubeadmConfig, bootstrapv1.GroupVersion.WithKind("KubeadmConfig"), controlPlane.KCP, controlPlane.Cluster); err != nil {
+					return false, errors.Wrapf(err, "failed to update KubeadmConfig %s", klog.KObj(kubeadmConfig))
+				}
 			}
 		}
 	}
 	// Update the patch helpers.
 	controlPlane.SetPatchHelpers(patchHelpers)
-	return nil
+	return anyManagedFieldIssueMitigated, nil
 }
 
 // reconcileControlPlaneAndMachinesConditions is responsible of reconciling conditions reporting the status of static pods and

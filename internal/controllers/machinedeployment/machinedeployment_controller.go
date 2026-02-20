@@ -42,12 +42,12 @@ import (
 	runtimeclient "sigs.k8s.io/cluster-api/exp/runtime/client"
 	"sigs.k8s.io/cluster-api/feature"
 	clientutil "sigs.k8s.io/cluster-api/internal/util/client"
-	capicontrollerutil "sigs.k8s.io/cluster-api/internal/util/controller"
 	"sigs.k8s.io/cluster-api/internal/util/ssa"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/cache"
 	"sigs.k8s.io/cluster-api/util/collections"
 	v1beta1conditions "sigs.k8s.io/cluster-api/util/conditions/deprecated/v1beta1"
+	capicontrollerutil "sigs.k8s.io/cluster-api/util/controller"
 	"sigs.k8s.io/cluster-api/util/finalizers"
 	clog "sigs.k8s.io/cluster-api/util/log"
 	"sigs.k8s.io/cluster-api/util/patch"
@@ -280,6 +280,18 @@ func (r *Reconciler) reconcile(ctx context.Context, s *scope) error {
 
 	if err := r.getAndAdoptMachineSetsForDeployment(ctx, s); err != nil {
 		return err
+	}
+
+	var anyManagedFieldIssueMitigated bool
+	for _, ms := range s.machineSets {
+		managedFieldIssueMitigated, err := ssa.MitigateManagedFieldsIssue(ctx, r.Client, ms, machineDeploymentManagerName)
+		if err != nil {
+			return err
+		}
+		anyManagedFieldIssueMitigated = anyManagedFieldIssueMitigated || managedFieldIssueMitigated
+	}
+	if anyManagedFieldIssueMitigated {
+		return nil // No requeue needed, changes will trigger another reconcile.
 	}
 
 	// If not already present, add a label specifying the MachineDeployment name to MachineSets.
