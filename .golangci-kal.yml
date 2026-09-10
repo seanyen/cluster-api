@@ -1,6 +1,6 @@
 version: "2"
 run:
-  go: "1.25"
+  go: "1.26"
   allow-parallel-runners: true
 linters:
   default: none
@@ -77,8 +77,11 @@ linters:
       - vendored_openapi\.go$
       - ".*_test.go"  # Exclude test files.
     rules:
-    ## KAL should only run on API folders.
+    ## KAL should only run on API folders, except api/runtime/catalog and api/deprecated.
     - path-except: "api//*"
+      linters:
+        - kubeapilinter
+    - path: "api/runtime/catalog|api/deprecated"
       linters:
         - kubeapilinter
 
@@ -135,7 +138,7 @@ linters:
         - kubeapilinter
 
     ## Removal of bool fields of existing types requires further discussion
-    - path: "api/bootstrap/kubeadm/v1beta2|api/controlplane/kubeadm/v1beta2|api/core/v1beta2|api/addons/v1beta2"
+    - path: "api/bootstrap/kubeadm/v1beta2|api/controlplane/kubeadm/v1beta2|api/core/v1beta2|api/addons/v1beta2|api/runtime/hooks/v1alpha1"
       text: "nobools"
       linters:
         - kubeapilinter

@@ -82,8 +82,9 @@ The domain for Cluster API resources is `cluster.x-k8s.io`, and infrastructure p
 generally use `infrastructure.cluster.x-k8s.io` as API group.
 
 If your provider uses a different API group, you MUST grant full read/write RBAC permissions for resources in your API group
-to the Cluster API core controllers. The canonical way to do so is via a `ClusterRole` resource with the [aggregation label]
-`cluster.x-k8s.io/aggregate-to-manager: "true"`.
+to the Cluster API core controllers. If any resource sets another resource as the owner with `blockOwnerDeletion` set,
+additional RBAC to update finalizers on the **owner resource** is required.
+The canonical way to do so is via a `ClusterRole` resource with the [aggregation label] `cluster.x-k8s.io/aggregate-to-manager: "true"`.
 
 The following is an example ClusterRole for a `FooMachinePool` resource in the `infrastructure.foo.com` API group:
 
@@ -339,7 +340,7 @@ Once `status.initialization.provisioned` is set, the MachinePool "core" controll
 
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
-In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_ preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_ preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regard to initialization completed:
 
@@ -384,7 +385,7 @@ See [Improving status in CAPI resources] for more context.
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to conditions:
 
@@ -424,7 +425,7 @@ See [Improving status in CAPI resources] for more context.
 
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
-In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_ preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_ preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to terminal failures:
 

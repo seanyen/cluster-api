@@ -21,7 +21,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
+	runtimecatalog "sigs.k8s.io/cluster-api/api/runtime/catalog"
 )
 
 // CanUpdateMachineRequest is the request of the CanUpdateMachine hook.
@@ -80,6 +80,11 @@ type CanUpdateMachineResponse struct {
 	// Only fields in spec have to be covered by the patch.
 	// +optional
 	BootstrapConfigPatch Patch `json:"bootstrapConfigPatch,omitempty,omitzero"`
+
+	// affectsAvailability indicates if the in-place update affects availability of the Machine.
+	// Default is true.
+	// +optional
+	AffectsAvailability *bool `json:"affectsAvailability,omitempty"`
 }
 
 // Patch is a single patch (JSONPatch or JSONMergePatch) which can include multiple operations.

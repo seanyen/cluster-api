@@ -108,6 +108,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	pflag.CommandLine.VisitAll(func(flag *pflag.Flag) {
+		klog.V(1).Infof("FLAG: --%s=%q", flag.Name, flag.Value)
+	})
+
 	// Add the klog logger in the context.
 	ctrl.SetLogger(klog.Background())
 
@@ -279,7 +283,7 @@ well with practices like unit testing and generally makes the entire system more
 
 ### Error messages
 
-RuntimeExtension authors should be aware that error messages are surfaced as conditions in Kubernetes resources
+RuntimeExtension authors should be aware that error messages might be surfaced as conditions in Kubernetes resources
 and recorded in Cluster API controller's logs. As a consequence:
 
 - Error message must not contain any sensitive information.

@@ -54,6 +54,7 @@ repo or add an item to the agenda in the [Cluster API community meeting](https:/
 | [InfraMachine: addresses]                                            | No        |                                      |
 | [InfraMachine: initialization completed]                             | Yes       |                                      |
 | [InfraMachine: conditions]                                           | No        |                                      |
+| [InfraMachine: interruptible]                                        | No        |                                      |
 | [InfraMachine: terminal failures]                                    | No        |                                      |
 | [InfraMachine: support for in-place changes]                         | No        |                                      |
 | [InfraMachineTemplate, InfraMachineTemplateList resource definition] | Yes       |                                      |
@@ -86,8 +87,9 @@ The domain for Cluster API resources is `cluster.x-k8s.io`, and infrastructure p
 generally use `infrastructure.cluster.x-k8s.io` as API group.
 
 If your provider uses a different API group, you MUST grant full read/write RBAC permissions for resources in your API group
-to the Cluster API core controllers. The canonical way to do so is via a `ClusterRole` resource with the [aggregation label]
-`cluster.x-k8s.io/aggregate-to-manager: "true"`.
+to the Cluster API core controllers. If any resource sets another resource as the owner with `blockOwnerDeletion` set,
+additional RBAC to update finalizers on the **owner resource** is required.
+The canonical way to do so is via a `ClusterRole` resource with the [aggregation label] `cluster.x-k8s.io/aggregate-to-manager: "true"`.
 
 The following is an example ClusterRole for a `FooMachine` resource in the `infrastructure.foo.com` API group:
 
@@ -261,7 +263,7 @@ type FooMachineStatus struct {
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regard to failure domain:
 
@@ -332,7 +334,7 @@ be surfaced on Machine's corresponding fields at the same time.
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regard to initialization completed:
 
@@ -372,7 +374,7 @@ See [Improving status in CAPI resources] for more context.
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to conditions:
 
@@ -382,6 +384,27 @@ Please note that provider that will continue to use deprecated Cluster API condi
 the implication of this choice which are described both in the [Cluster API v1.11 migration notes] and in the [Improving status in CAPI resources] proposal.
 
 </aside>
+
+### InfraMachine: interruptible
+
+In case the Machine is backed by a non-guaranteed instance, e.g. a spot instance on a cloud provider, infrastructure
+providers can surface this by setting `status.interruptible` to `true` in the InfraMachine resource.
+
+```go
+type FooMachineStatus struct {
+    // interruptible reports that this machine can be interrupted.
+    // +optional
+    Interruptible *bool `json:"interruptible,omitempty"`
+
+    // See other rules for more details about mandatory/optional fields in InfraMachine status.
+    // Other fields SHOULD be added based on the needs of your provider.
+}
+```
+
+Once `status.interruptible` is set to `true`, the Machine controller will add the `cluster.x-k8s.io/interruptible`
+label to the corresponding Node; this can then be used, for example, by a DaemonSet dedicated to gracefully
+handling the termination of workloads running on interruptible instances.
+
 
 ### InfraMachine: terminal failures
 
@@ -397,7 +420,7 @@ See [Improving status in CAPI resources] for more context.
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to terminal failures:
 
@@ -492,12 +515,12 @@ However, in case you immutability checks for your InfraMachineTemplate, this can
 
 In order to avoid this InfraMachineTemplate MUST specifically implement support for SSA dry run calls from the topology controller. 
 
-The implementation requires to use controller runtime's `CustomValidator`, available in CR versions >= v0.12.3.
+The implementation requires to use controller runtime's `Validator`.
 
 This will allow to skip the immutability check only when the topology controller is dry running while preserving the
 validation behavior for all other cases.
 
-See [the DockerMachineTemplate webhook] as a reference for a compatible implementation.
+See [the DevMachineTemplate webhook] as a reference for a compatible implementation.
 
 ### Multi tenancy
 
@@ -657,9 +680,11 @@ is implemented in InfraMachine controllers:
 [InfraMachine: failure domain]: #inframachine-failure-domain
 [InfraMachine: addresses]: #inframachine-addresses
 [InfraMachine: initialization completed]: #inframachine-initialization-completed
+[InfraMachine: support for in-place changes]: #inframachine-support-for-in-place-changes
 [Improving status in CAPI resources]: https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240916-improve-status-in-CAPI-resources.md
 [InfraMachine: conditions]: #inframachine-conditions
 [Kubernetes API Conventions]: https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+[InfraMachine: interruptible]: #inframachine-interruptible
 [InfraMachine: terminal failures]: #inframachine-terminal-failures
 [InfraMachineTemplate, InfraMachineTemplateList resource definition]: #inframachinetemplate-inframachinetemplatelist-resource-definition
 [InfraMachineTemplate: support for SSA dry run]: #inframachinetemplate-support-for-ssa-dry-run
@@ -670,8 +695,8 @@ is implemented in InfraMachine controllers:
 [implementation best practices]: ../best-practices.md
 [infrastructure Provider Security Guidance]: ../security-guidelines.md
 [Server Side Apply]: https://kubernetes.io/docs/reference/using-api/server-side-apply/
-[the DockerMachineTemplate webhook]: https://github.com/kubernetes-sigs/cluster-api/blob/main/test/infrastructure/docker/internal/webhooks/dockermachinetemplate.go
-[Cluster API v1.11 migration notes]: ../migrations/v1.10-to-v1.11.md
+[the DevMachineTemplate webhook]: https://github.com/kubernetes-sigs/cluster-api/blob/main/test/infrastructure/docker/webhooks/admission/devmachinetemplate.go
+[Cluster API v1.11 migration notes]: https://release-1-11.cluster-api.sigs.k8s.io/developer/providers/migrations/v1.10-to-v1.11
 [Opt-in Autoscaling from Zero]: https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20210310-opt-in-autoscaling-from-zero.md
 [InfraMachine: pausing]: #inframachine-pausing
 [InfraMachineTemplate: support cluster autoscaling from zero]: #inframachinetemplate-support-cluster-autoscaling-from-zero

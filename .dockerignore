@@ -5,7 +5,6 @@ bin/
 **/*.yaml
 hack/
 docs/
-logos/
 scripts/
 **/*.md
 tilt-settings.json
@@ -54,3 +53,5 @@ go.work.sum
 **/*.tmp
 **/.DS_Store
 **/*.swp
+
+tmp/

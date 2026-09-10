@@ -22,14 +22,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	pkgerrors "github.com/pkg/errors"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/rest"
+	toolscache "k8s.io/client-go/tools/cache"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/cache"
+	ctrlcache "sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -97,8 +98,11 @@ type clusterAccessorCacheConfig struct {
 	// SyncPeriod is the sync period of the cache.
 	SyncPeriod *time.Duration
 
+	// DefaultTransform is applied to all objects before they are stored in the cache.
+	DefaultTransform toolscache.TransformFunc
+
 	// ByObject restricts the cache's ListWatch to the desired fields per GVK at the specified object.
-	ByObject map[client.Object]cache.ByObject
+	ByObject map[client.Object]ctrlcache.ByObject
 
 	// Indexes are the indexes added to the cache.
 	Indexes []CacheOptionsIndex
@@ -243,17 +247,20 @@ func (ca *clusterAccessor) Connect(ctx context.Context) (retErr error) {
 		return nil
 	}
 
-	log.Info("Connecting")
+	start := time.Now()
+	log.V(4).Info("Connecting")
 
 	// Creating clients, cache etc. is intentionally done without a lock to avoid blocking other reconcilers.
 	connection, err := ca.createConnection(ctx)
+
+	duration := time.Since(start)
 
 	ca.lock(ctx)
 	defer ca.unlock(ctx)
 
 	defer func() {
 		if retErr != nil {
-			log.Error(retErr, "Connect failed")
+			log.Error(retErr, "Connect failed", "duration", duration)
 			connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(0)
 			ca.lockedState.lastConnectionCreationErrorTime = time.Now()
 			// A client creation just failed, so let's count this as a failed probe.
@@ -269,7 +276,7 @@ func (ca *clusterAccessor) Connect(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	log.Info("Connected")
+	log.Info("Connected", "duration", duration)
 
 	now := time.Now()
 	ca.lockedState.healthChecking = clusterAccessorLockedHealthCheckingState{
@@ -304,7 +311,7 @@ func (ca *clusterAccessor) Disconnect(ctx context.Context) {
 		ca.unlock(ctx)
 		connectionUp.WithLabelValues(ca.cluster.Name, ca.cluster.Namespace).Set(0)
 	}()
-	log.Info("Disconnecting")
+	log.V(4).Info("Disconnecting")
 
 	// Stopping the cache is non-blocking, so it's okay to do it while holding the lock.
 	// Note: Stopping the cache will also trigger shutdown of all informers that have been added to the cache.
@@ -373,7 +380,7 @@ func (ca *clusterAccessor) GetClient(ctx context.Context) (client.Client, error)
 	defer ca.rUnlock(ctx)
 
 	if ca.lockedState.connection == nil {
-		return nil, errors.Wrapf(ErrClusterNotConnected, "error getting client")
+		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting client")
 	}
 
 	return ca.lockedState.connection.cachedClient, nil
@@ -384,7 +391,7 @@ func (ca *clusterAccessor) GetReader(ctx context.Context) (client.Reader, error)
 	defer ca.rUnlock(ctx)
 
 	if ca.lockedState.connection == nil {
-		return nil, errors.Wrapf(ErrClusterNotConnected, "error getting client reader")
+		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting client reader")
 	}
 
 	return ca.lockedState.connection.cachedClient, nil
@@ -396,7 +403,7 @@ func (ca *clusterAccessor) GetUncachedClient(ctx context.Context) (client.Client
 	defer ca.rUnlock(ctx)
 
 	if ca.lockedState.connection == nil {
-		return nil, errors.Wrapf(ErrClusterNotConnected, "error getting uncached client")
+		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting uncached client")
 	}
 
 	return ca.lockedState.connection.uncachedClient, nil
@@ -407,7 +414,7 @@ func (ca *clusterAccessor) GetRESTConfig(ctx context.Context) (*rest.Config, err
 	defer ca.rUnlock(ctx)
 
 	if ca.lockedState.connection == nil {
-		return nil, errors.Wrapf(ErrClusterNotConnected, "error getting REST config")
+		return nil, pkgerrors.WithMessage(ErrClusterNotConnected, "error getting REST config")
 	}
 
 	return ca.lockedState.connection.restConfig, nil
@@ -419,11 +426,11 @@ func (ca *clusterAccessor) GetRESTConfig(ctx context.Context) (*rest.Config, err
 // After a re-connect watches will be re-added (assuming the Watch method is called again).
 func (ca *clusterAccessor) Watch(ctx context.Context, watcher Watcher) error {
 	if watcher.Name() == "" {
-		return errors.New("watcher.Name() cannot be empty")
+		return pkgerrors.New("watcher.Name() cannot be empty")
 	}
 
 	if !ca.Connected(ctx) {
-		return errors.Wrapf(ErrClusterNotConnected, "error creating watch %s for %T", watcher.Name(), watcher.Object())
+		return pkgerrors.WithMessagef(ErrClusterNotConnected, "error creating watch %s for %T", watcher.Name(), watcher.Object())
 	}
 
 	log := ctrl.LoggerFrom(ctx)
@@ -436,7 +443,7 @@ func (ca *clusterAccessor) Watch(ctx context.Context, watcher Watcher) error {
 
 	// Checking connection again while holding the lock, because maybe Disconnect was called since checking above.
 	if ca.lockedState.connection == nil {
-		return errors.Wrapf(ErrClusterNotConnected, "error creating watch %s for %T", watcher.Name(), watcher.Object())
+		return pkgerrors.WithMessagef(ErrClusterNotConnected, "error creating watch %s for %T", watcher.Name(), watcher.Object())
 	}
 
 	// Return early if the watch was already added.
@@ -445,9 +452,9 @@ func (ca *clusterAccessor) Watch(ctx context.Context, watcher Watcher) error {
 		return nil
 	}
 
-	log.Info(fmt.Sprintf("Creating watch %s for %T", watcher.Name(), watcher.Object()))
+	log.Info(fmt.Sprintf("Creating %T watch for watcher: %s", watcher.Object(), watcher.Name()))
 	if err := watcher.Watch(ca.lockedState.connection.cache); err != nil {
-		return errors.Wrapf(err, "error creating watch %s for %T", watcher.Name(), watcher.Object())
+		return pkgerrors.WithMessagef(err, "error creating %T watch for watcher: %s", watcher.Object(), watcher.Name())
 	}
 
 	ca.lockedState.connection.watches.Insert(watcher.Name())

@@ -20,7 +20,7 @@ spec:
         - "--leader-elect"
         - "--diagnostics-address=${CAPI_DIAGNOSTICS_ADDRESS:=:8443}"
         - "--insecure-diagnostics=${CAPI_INSECURE_DIAGNOSTICS:=false}"
-        - "--feature-gates=MachinePool=${EXP_MACHINE_POOL:=true},ClusterTopology=${CLUSTER_TOPOLOGY:=false},PriorityQueue=${EXP_PRIORITY_QUEUE:=true},ReconcilerRateLimiting=${EXP_RECONCILER_RATE_LIMITING:=false}"
+        - "--feature-gates=MachinePool=${EXP_MACHINE_POOL:=true},ClusterTopology=${CLUSTER_TOPOLOGY:=false},PriorityQueue=${EXP_PRIORITY_QUEUE:=true},ReconcilerRateLimiting=${EXP_RECONCILER_RATE_LIMITING:=true}"
         image: controller:latest
         name: manager
         env:
@@ -42,6 +42,8 @@ spec:
               fieldPath: status.podIP
         - name: DOCKER_HOST
           value: ${CAPD_DOCKER_HOST:=""}
+        - name: DOCKER_NETWORK
+          value: ${CAPD_DOCKER_NETWORK:=""}
         ports:
         - containerPort: 9440
           name: healthz

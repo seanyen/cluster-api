@@ -17,6 +17,7 @@ limitations under the License.
 package desiredstate
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -40,12 +41,12 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	controlplanev1 "sigs.k8s.io/cluster-api/api/controlplane/kubeadm/v1beta2"
-	clusterv1beta1 "sigs.k8s.io/cluster-api/api/core/v1beta1"
 	clusterv1 "sigs.k8s.io/cluster-api/api/core/v1beta2"
+	runtimecatalog "sigs.k8s.io/cluster-api/api/runtime/catalog"
 	runtimehooksv1 "sigs.k8s.io/cluster-api/api/runtime/hooks/v1alpha1"
 	runtimev1 "sigs.k8s.io/cluster-api/api/runtime/v1beta2"
 	"sigs.k8s.io/cluster-api/controllers/clustercache"
-	runtimecatalog "sigs.k8s.io/cluster-api/exp/runtime/catalog"
+	"sigs.k8s.io/cluster-api/core/webhooks/conversion"
 	"sigs.k8s.io/cluster-api/exp/topology/scope"
 	"sigs.k8s.io/cluster-api/feature"
 	"sigs.k8s.io/cluster-api/internal/contract"
@@ -55,7 +56,7 @@ import (
 	"sigs.k8s.io/cluster-api/internal/topology/ownerrefs"
 	"sigs.k8s.io/cluster-api/util"
 	"sigs.k8s.io/cluster-api/util/cache"
-	"sigs.k8s.io/cluster-api/util/conversion"
+	conversionutil "sigs.k8s.io/cluster-api/util/conversion"
 	"sigs.k8s.io/cluster-api/util/test/builder"
 )
 
@@ -181,7 +182,7 @@ func TestComputeInfrastructureCluster(t *testing.T) {
 		obj, err := computeInfrastructureCluster(ctx, scope)
 		g.Expect(err).ToNot(HaveOccurred())
 		g.Expect(obj).ToNot(BeNil())
-		g.Expect(ownerrefs.HasOwnerReferenceFrom(obj, shim)).To(BeTrue())
+		g.Expect(ownerrefs.HasOwnerReferenceFrom(obj, shim, corev1.SchemeGroupVersion.WithKind("Secret"))).To(BeTrue())
 	})
 }
 
@@ -380,9 +381,13 @@ func TestComputeControlPlane(t *testing.T) {
 	clusterClassReadinessGates := []clusterv1.MachineReadinessGate{
 		{ConditionType: "foo"},
 	}
+	clusterClassTaints := []clusterv1.MachineTaint{
+		{Key: "foo", Effect: corev1.TaintEffectPreferNoSchedule, Propagation: clusterv1.MachineTaintPropagationAlways},
+	}
 	clusterClass := builder.ClusterClass(metav1.NamespaceDefault, "class1").
 		WithControlPlaneMetadata(labels, annotations).
 		WithControlPlaneReadinessGates(clusterClassReadinessGates).
+		WithControlPlaneTaints(clusterClassTaints).
 		WithControlPlaneTemplate(controlPlaneTemplate).
 		WithControlPlaneNodeDrainTimeout(&clusterClassDuration).
 		WithControlPlaneNodeVolumeDetachTimeout(&clusterClassDuration).
@@ -396,9 +401,14 @@ func TestComputeControlPlane(t *testing.T) {
 	nodeDrainTimeout := topologyDuration
 	nodeVolumeDetachTimeout := topologyDuration
 	nodeDeletionTimeout := topologyDuration
+	rolloutAfter := metav1.Now().Rfc3339Copy()
 	readinessGates := []clusterv1.MachineReadinessGate{
 		{ConditionType: "foo"},
 		{ConditionType: "bar"},
+	}
+	taints := []clusterv1.MachineTaint{
+		{Key: "foo", Effect: corev1.TaintEffectPreferNoSchedule, Propagation: clusterv1.MachineTaintPropagationAlways},
+		{Key: "bar", Effect: corev1.TaintEffectPreferNoSchedule, Propagation: clusterv1.MachineTaintPropagationAlways},
 	}
 	cluster := &clusterv1.Cluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -414,7 +424,11 @@ func TestComputeControlPlane(t *testing.T) {
 						Annotations: map[string]string{"a2": ""},
 					},
 					ReadinessGates: readinessGates,
+					Taints:         taints,
 					Replicas:       &replicas,
+					Rollout: clusterv1.ControlPlaneTopologyRolloutSpec{
+						After: rolloutAfter,
+					},
 					Deletion: clusterv1.ControlPlaneTopologyMachineDeletionSpec{
 						NodeDrainTimeoutSeconds:        &nodeDrainTimeout,
 						NodeVolumeDetachTimeoutSeconds: &nodeVolumeDetachTimeout,
@@ -433,6 +447,15 @@ func TestComputeControlPlane(t *testing.T) {
 	g.Expect(err).ToNot(HaveOccurred())
 	var expectedReadinessGates []interface{}
 	g.Expect(json.Unmarshal(jsonValue, &expectedReadinessGates)).ToNot(HaveOccurred())
+
+	jsonValue, err = json.Marshal(&clusterClassTaints)
+	g.Expect(err).ToNot(HaveOccurred())
+	var expectedClusterClassTaints []interface{}
+	g.Expect(json.Unmarshal(jsonValue, &expectedClusterClassTaints)).ToNot(HaveOccurred())
+	jsonValue, err = json.Marshal(&taints)
+	g.Expect(err).ToNot(HaveOccurred())
+	var expectedTaints []interface{}
+	g.Expect(json.Unmarshal(jsonValue, &expectedTaints)).ToNot(HaveOccurred())
 
 	scheme := runtime.NewScheme()
 	_ = clusterv1.AddToScheme(scheme)
@@ -481,7 +504,9 @@ func TestComputeControlPlane(t *testing.T) {
 
 		assertNestedField(g, obj, version, contract.ControlPlane().Version().Path()...)
 		assertNestedField(g, obj, int64(replicas), contract.ControlPlane().Replicas().Path()...)
+		assertNestedField(g, obj, rolloutAfter.ToUnstructured(), contract.ControlPlane().RolloutAfter().Path()...)
 		assertNestedField(g, obj, expectedReadinessGates, contract.ControlPlane().MachineTemplate().ReadinessGates("v1beta1").Path()...)
+		assertNestedField(g, obj, expectedTaints, contract.ControlPlane().MachineTemplate().Taints("v1beta1").Path()...)
 		assertNestedField(g, obj, (time.Duration(topologyDuration) * time.Second).String(), contract.ControlPlane().MachineTemplate().NodeDrainTimeout().Path()...)
 		assertNestedField(g, obj, (time.Duration(topologyDuration) * time.Second).String(), contract.ControlPlane().MachineTemplate().NodeVolumeDetachTimeout().Path()...)
 		assertNestedField(g, obj, (time.Duration(topologyDuration) * time.Second).String(), contract.ControlPlane().MachineTemplate().NodeDeletionTimeout().Path()...)
@@ -521,7 +546,9 @@ func TestComputeControlPlane(t *testing.T) {
 
 		assertNestedField(g, obj, version, contract.ControlPlane().Version().Path()...)
 		assertNestedField(g, obj, int64(replicas), contract.ControlPlane().Replicas().Path()...)
+		assertNestedField(g, obj, rolloutAfter.ToUnstructured(), contract.ControlPlane().RolloutAfter().Path()...)
 		assertNestedField(g, obj, expectedReadinessGates, contract.ControlPlane().MachineTemplate().ReadinessGates("v1beta2").Path()...)
+		assertNestedField(g, obj, expectedTaints, contract.ControlPlane().MachineTemplate().Taints("v1beta2").Path()...)
 		assertNestedField(g, obj, int64(topologyDuration), contract.ControlPlane().MachineTemplate().NodeDrainTimeoutSeconds().Path()...)
 		assertNestedField(g, obj, int64(topologyDuration), contract.ControlPlane().MachineTemplate().NodeVolumeDetachTimeoutSeconds().Path()...)
 		assertNestedField(g, obj, int64(topologyDuration), contract.ControlPlane().MachineTemplate().NodeDeletionTimeoutSeconds().Path()...)
@@ -571,6 +598,7 @@ func TestComputeControlPlane(t *testing.T) {
 
 		// checking only values from CC defaults
 		assertNestedField(g, obj, expectedClusterClassReadinessGates, contract.ControlPlane().MachineTemplate().ReadinessGates("v1beta1").Path()...)
+		assertNestedField(g, obj, expectedClusterClassTaints, contract.ControlPlane().MachineTemplate().Taints("v1beta1").Path()...)
 		assertNestedField(g, obj, (time.Duration(clusterClassDuration) * time.Second).String(), contract.ControlPlane().MachineTemplate().NodeDrainTimeout().Path()...)
 		assertNestedField(g, obj, (time.Duration(clusterClassDuration) * time.Second).String(), contract.ControlPlane().MachineTemplate().NodeVolumeDetachTimeout().Path()...)
 		assertNestedField(g, obj, (time.Duration(clusterClassDuration) * time.Second).String(), contract.ControlPlane().MachineTemplate().NodeDeletionTimeout().Path()...)
@@ -616,6 +644,7 @@ func TestComputeControlPlane(t *testing.T) {
 
 		// checking only values from CC defaults
 		assertNestedField(g, obj, expectedClusterClassReadinessGates, contract.ControlPlane().MachineTemplate().ReadinessGates("v1beta2").Path()...)
+		assertNestedField(g, obj, expectedClusterClassTaints, contract.ControlPlane().MachineTemplate().Taints("v1beta2").Path()...)
 		assertNestedField(g, obj, int64(clusterClassDuration), contract.ControlPlane().MachineTemplate().NodeDrainTimeoutSeconds().Path()...)
 		assertNestedField(g, obj, int64(clusterClassDuration), contract.ControlPlane().MachineTemplate().NodeVolumeDetachTimeoutSeconds().Path()...)
 		assertNestedField(g, obj, int64(clusterClassDuration), contract.ControlPlane().MachineTemplate().NodeDeletionTimeoutSeconds().Path()...)
@@ -684,6 +713,34 @@ func TestComputeControlPlane(t *testing.T) {
 
 		assertNestedFieldUnset(g, obj, contract.ControlPlane().MachineTemplate().ReadinessGates("v1beta1").Path()...)
 		assertNestedFieldUnset(g, obj, contract.ControlPlane().MachineTemplate().ReadinessGates("v1beta2").Path()...)
+	})
+	t.Run("Skips setting taints if not set in Cluster and ClusterClass", func(t *testing.T) {
+		g := NewWithT(t)
+
+		clusterClassWithoutTaints := clusterClass.DeepCopy()
+		clusterClassWithoutTaints.Spec.ControlPlane.Taints = nil
+
+		clusterWithoutTaints := cluster.DeepCopy()
+		clusterWithoutTaints.Spec.Topology.ControlPlane.Taints = nil
+
+		blueprint := &scope.ClusterBlueprint{
+			Topology:     clusterWithoutTaints.Spec.Topology,
+			ClusterClass: clusterClassWithoutTaints,
+			ControlPlane: &scope.ControlPlaneBlueprint{
+				Template: controlPlaneTemplate,
+			},
+		}
+
+		// aggregating current cluster objects into ClusterState (simulating getCurrentState)
+		scope := scope.New(clusterWithoutTaints)
+		scope.Blueprint = blueprint
+
+		obj, err := (&generator{Client: clientWithV1Beta2ContractCRD}).computeControlPlane(ctx, scope, nil)
+		g.Expect(err).ToNot(HaveOccurred())
+		g.Expect(obj).ToNot(BeNil())
+
+		assertNestedFieldUnset(g, obj, contract.ControlPlane().MachineTemplate().Taints("v1beta1").Path()...)
+		assertNestedFieldUnset(g, obj, contract.ControlPlane().MachineTemplate().Taints("v1beta2").Path()...)
 	})
 	t.Run("Generates the ControlPlane from the template and adds the infrastructure machine template if required (v1beta1 contract)", func(t *testing.T) {
 		g := NewWithT(t)
@@ -1027,7 +1084,7 @@ func TestComputeControlPlane(t *testing.T) {
 		obj, err := (&generator{Client: clientWithV1Beta2ContractCRD}).computeControlPlane(ctx, s, nil)
 		g.Expect(err).ToNot(HaveOccurred())
 		g.Expect(obj).ToNot(BeNil())
-		g.Expect(ownerrefs.HasOwnerReferenceFrom(obj, shim)).To(BeTrue())
+		g.Expect(ownerrefs.HasOwnerReferenceFrom(obj, shim, corev1.SchemeGroupVersion.WithKind("Secret"))).To(BeTrue())
 	})
 }
 
@@ -1040,7 +1097,7 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 		},
 	}
 
-	apiVersionGetter := func(gk schema.GroupKind) (string, error) {
+	t.Cleanup(conversion.SwapAPIVersionGetter(func(_ context.Context, gk schema.GroupKind) (string, error) {
 		for _, gvk := range testGVKs {
 			if gvk.GroupKind() == gk {
 				return schema.GroupVersion{
@@ -1050,8 +1107,7 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 			}
 		}
 		return "", fmt.Errorf("unknown GroupVersionKind: %v", gk)
-	}
-	clusterv1beta1.SetAPIVersionGetter(apiVersionGetter)
+	}))
 
 	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
 
@@ -1603,7 +1659,7 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 							Annotations: map[string]string{
 								"fizz":                             "buzz",
 								corev1.LastAppliedConfigAnnotation: "should be cleaned up",
-								conversion.DataAnnotation:          "should be cleaned up",
+								conversionutil.DataAnnotation:      "should be cleaned up",
 							},
 						},
 						// Add some more fields to check that conversion implemented when calling RuntimeExtension are properly handled.
@@ -1660,7 +1716,7 @@ func TestComputeControlPlaneVersion(t *testing.T) {
 			r := &generator{
 				Client:        fakeClient,
 				RuntimeClient: runtimeClient,
-				hookCache:     cache.New[cache.HookEntry](cache.HookCacheDefaultTTL),
+				hookCache:     cache.New[cache.HookEntry](ctx, cache.HookCacheDefaultTTL),
 			}
 			version, err := r.computeControlPlaneVersion(ctx, s)
 			if tt.wantErr {
@@ -1705,10 +1761,6 @@ func TestComputeCluster(t *testing.T) {
 	g.Expect(obj).ToNot(BeNil())
 	g.Expect(err).ToNot(HaveOccurred())
 
-	// TypeMeta
-	g.Expect(obj.APIVersion).To(Equal(cluster.APIVersion))
-	g.Expect(obj.Kind).To(Equal(cluster.Kind))
-
 	// ObjectMeta
 	g.Expect(obj.Name).To(Equal(cluster.Name))
 	g.Expect(obj.Namespace).To(Equal(cluster.Namespace))
@@ -1720,7 +1772,27 @@ func TestComputeCluster(t *testing.T) {
 	g.Expect(obj.Spec.InfrastructureRef).To(BeComparableTo(contract.ObjToContractVersionedObjectReference(infrastructureCluster)))
 	g.Expect(obj.Spec.ControlPlaneRef).To(BeComparableTo(contract.ObjToContractVersionedObjectReference(controlPlane)))
 
-	// Surfaces the ClusterTopologyUpgradeStepAnnotation annotation during upgrades.
+	// Surfaces the ClusterTopologyUpgradeStepAnnotation annotation during upgrades when runtime SDK feature flag is off.
+
+	s.UpgradeTracker.MachineDeployments.UpgradePlan = []string{"v1.30.3"}
+
+	obj, err = computeCluster(ctx, s, infrastructureCluster, controlPlane)
+	g.Expect(obj).ToNot(BeNil())
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(obj.GetAnnotations()).To(HaveKeyWithValue(clusterv1.ClusterTopologyUpgradeStepAnnotation, "v1.30.3"))
+
+	s.UpgradeTracker.MachineDeployments.UpgradePlan = nil
+
+	obj, err = computeCluster(ctx, s, infrastructureCluster, controlPlane)
+	g.Expect(obj).ToNot(BeNil())
+	g.Expect(err).ToNot(HaveOccurred())
+
+	g.Expect(obj.GetAnnotations()).ToNot(HaveKey(clusterv1.ClusterTopologyUpgradeStepAnnotation))
+
+	// Surfaces the ClusterTopologyUpgradeStepAnnotation annotation during upgrades when runtime SDK feature flag is on.
+	utilfeature.SetFeatureGateDuringTest(t, feature.Gates, feature.RuntimeSDK, true)
+
 	annotations := s.Current.Cluster.GetAnnotations()
 	if annotations == nil {
 		annotations = map[string]string{}
@@ -1799,6 +1871,9 @@ func TestComputeMachineDeployment(t *testing.T) {
 	clusterClassReadinessGates := []clusterv1.MachineReadinessGate{
 		{ConditionType: "foo"},
 	}
+	clusterClassTaints := []clusterv1.MachineTaint{
+		{Key: "clusterClassTaintFoo", Effect: corev1.TaintEffectPreferNoSchedule, Propagation: clusterv1.MachineTaintPropagationAlways},
+	}
 	md1 := builder.MachineDeploymentClass("linux-worker").
 		WithLabels(labels).
 		WithAnnotations(annotations).
@@ -1812,6 +1887,7 @@ func TestComputeMachineDeployment(t *testing.T) {
 			},
 		}).
 		WithReadinessGates(clusterClassReadinessGates).
+		WithTaints(clusterClassTaints).
 		WithFailureDomain(clusterClassFailureDomain).
 		WithNodeDrainTimeout(&clusterClassDuration).
 		WithNodeVolumeDetachTimeout(&clusterClassDuration).
@@ -1881,6 +1957,10 @@ func TestComputeMachineDeployment(t *testing.T) {
 		{ConditionType: "foo"},
 		{ConditionType: "bar"},
 	}
+	taints := []clusterv1.MachineTaint{
+		{Key: "clusterTaintFoo", Effect: corev1.TaintEffectPreferNoSchedule, Propagation: clusterv1.MachineTaintPropagationAlways},
+		{Key: "clusterTaintBar", Effect: corev1.TaintEffectPreferNoSchedule, Propagation: clusterv1.MachineTaintPropagationAlways},
+	}
 	mdTopology := clusterv1.MachineDeploymentTopology{
 		Metadata: clusterv1.ObjectMeta{
 			Labels: map[string]string{
@@ -1911,6 +1991,7 @@ func TestComputeMachineDeployment(t *testing.T) {
 		Rollout: clusterv1.MachineDeploymentTopologyRolloutSpec{
 			Strategy: topologyStrategy,
 		},
+		Taints: taints,
 	}
 
 	t.Run("Generates the machine deployment and the referenced templates", func(t *testing.T) {
@@ -1948,6 +2029,7 @@ func TestComputeMachineDeployment(t *testing.T) {
 		g.Expect(*actualMd.Spec.Template.Spec.Deletion.NodeVolumeDetachTimeoutSeconds).To(Equal(topologyDuration))
 		g.Expect(*actualMd.Spec.Template.Spec.Deletion.NodeDeletionTimeoutSeconds).To(Equal(topologyDuration))
 		g.Expect(actualMd.Spec.Template.Spec.ReadinessGates).To(Equal(readinessGates))
+		g.Expect(actualMd.Spec.Template.Spec.Taints).To(Equal(taints))
 		g.Expect(actualMd.Spec.ClusterName).To(Equal("cluster1"))
 		g.Expect(actualMd.Name).To(ContainSubstring("cluster1"))
 		g.Expect(actualMd.Name).To(ContainSubstring("big-pool-of-machines"))
@@ -1989,7 +2071,7 @@ func TestComputeMachineDeployment(t *testing.T) {
 			Class:    "linux-worker",
 			Name:     "big-pool-of-machines",
 			Replicas: &replicas,
-			// missing ReadinessGates, FailureDomain, NodeDrainTimeoutSeconds, NodeVolumeDetachTimeoutSeconds, NodeDeletionTimeoutSeconds, MinReadySeconds, Strategy, deletion.Order, remediation
+			// missing ReadinessGates, FailureDomain, NodeDrainTimeoutSeconds, NodeVolumeDetachTimeoutSeconds, NodeDeletionTimeoutSeconds, MinReadySeconds, Strategy, deletion.Order, remediation, taints
 		}
 
 		e := generator{}
@@ -2003,6 +2085,7 @@ func TestComputeMachineDeployment(t *testing.T) {
 		g.Expect(actualMd.Spec.Template.Spec.MinReadySeconds).To(HaveValue(Equal(clusterClassMinReadySeconds)))
 		g.Expect(actualMd.Spec.Template.Spec.FailureDomain).To(Equal(clusterClassFailureDomain))
 		g.Expect(actualMd.Spec.Template.Spec.ReadinessGates).To(Equal(clusterClassReadinessGates))
+		g.Expect(actualMd.Spec.Template.Spec.Taints).To(Equal(clusterClassTaints))
 		g.Expect(actualMd.Spec.Remediation.MaxInFlight).To(Equal(clusterClassHealthCheck.Remediation.MaxInFlight))
 		g.Expect(actualMd.Spec.Deletion.Order).To(Equal(clusterClassDeletionOrder))
 		g.Expect(*actualMd.Spec.Template.Spec.Deletion.NodeDrainTimeoutSeconds).To(Equal(clusterClassDuration))
@@ -2059,6 +2142,57 @@ func TestComputeMachineDeployment(t *testing.T) {
 		// checking only values from CC defaults
 		actualMd := actual.Object
 		g.Expect(actualMd.Spec.Template.Spec.ReadinessGates).To(BeNil())
+	})
+
+	t.Run("Skips setting taints if not set in Cluster and ClusterClass", func(t *testing.T) {
+		g := NewWithT(t)
+
+		clusterClassWithoutTaints := fakeClass.DeepCopy()
+		clusterClassWithoutTaints.Spec.Workers.MachineDeployments[0].Taints = nil
+
+		blueprint := &scope.ClusterBlueprint{
+			Topology:     cluster.Spec.Topology,
+			ClusterClass: clusterClassWithoutTaints,
+			MachineDeployments: map[string]*scope.MachineDeploymentBlueprint{
+				"linux-worker": {
+					Metadata: clusterv1.ObjectMeta{
+						Labels:      labels,
+						Annotations: annotations,
+					},
+					BootstrapTemplate:             workerBootstrapTemplate,
+					InfrastructureMachineTemplate: workerInfrastructureMachineTemplate,
+					HealthCheck: clusterv1.MachineDeploymentClassHealthCheck{
+						Checks: clusterv1.MachineDeploymentClassHealthCheckChecks{
+							UnhealthyNodeConditions:    unhealthyNodeConditions,
+							UnhealthyMachineConditions: unhealthyMachineConditions,
+							NodeStartupTimeoutSeconds:  ptr.To(int32(1)),
+						},
+					},
+				},
+			},
+		}
+
+		scope := scope.New(cluster)
+		scope.Blueprint = blueprint
+
+		mdTopology := clusterv1.MachineDeploymentTopology{
+			Metadata: clusterv1.ObjectMeta{
+				Labels: map[string]string{"foo": "baz"},
+			},
+			Class:    "linux-worker",
+			Name:     "big-pool-of-machines",
+			Replicas: &replicas,
+			// missing Taints
+		}
+
+		e := generator{}
+
+		actual, err := e.computeMachineDeployment(ctx, scope, mdTopology)
+		g.Expect(err).ToNot(HaveOccurred())
+
+		// checking only values from CC defaults
+		actualMd := actual.Object
+		g.Expect(actualMd.Spec.Template.Spec.Taints).To(BeNil())
 	})
 
 	t.Run("If there is already a machine deployment, it preserves the object name and the reference names", func(t *testing.T) {
@@ -3557,6 +3691,7 @@ func assertTemplateToTemplate(g *WithT, in assertTemplateInput) {
 }
 
 func assertNestedField(g *WithT, obj *unstructured.Unstructured, value interface{}, fields ...string) {
+	g.THelper()
 	v, ok, err := unstructured.NestedFieldCopy(obj.UnstructuredContent(), fields...)
 
 	g.Expect(err).ToNot(HaveOccurred())
@@ -3646,10 +3781,6 @@ func Test_computeMachineHealthCheck(t *testing.T) {
 	healthCheckTarget := builder.MachineDeployment("ns1", "md1").Build()
 	cluster := builder.Cluster("ns1", "cluster1").Build()
 	want := &clusterv1.MachineHealthCheck{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: clusterv1.GroupVersion.String(),
-			Kind:       "MachineHealthCheck",
-		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "md1",
 			Namespace: "ns1",
@@ -3895,8 +4026,8 @@ func TestGenerate(t *testing.T) {
 			fakeClient,
 			clusterCache,
 			fakeRuntimeClient,
-			cache.New[cache.HookEntry](cache.HookCacheDefaultTTL),
-			cache.New[GenerateUpgradePlanCacheEntry](10*time.Minute),
+			cache.New[cache.HookEntry](ctx, cache.HookCacheDefaultTTL),
+			cache.New[GenerateUpgradePlanCacheEntry](ctx, 10*time.Minute),
 		)
 		g.Expect(err).ToNot(HaveOccurred())
 

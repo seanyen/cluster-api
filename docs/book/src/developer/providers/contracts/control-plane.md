@@ -67,6 +67,7 @@ repo or add an item to the agenda in the [Cluster API community meeting](https:/
 | [ControlPlane: replicas]                                             | No        | Mandatory if control plane has a notion of number of instances.                                                            |
 | [ControlPlane: version]                                              | No        | Mandatory if control plane allows direct management of the Kubernetes version in use; Mandatory for cluster class support. |
 | [ControlPlane: machines]                                             | No        | Mandatory if control plane instances are represented with a set of Cluster API Machines.                                   |
+| [ControlPlane: rolloutAfter]                                         | No        |                                                                                                                            |
 | [ControlPlane: initialization completed]                             | Yes       |                                                                                                                            |
 | [ControlPlane: in-place updates]                                     | No        | Only supported for control plane providers with control plane machines                                                     |
 | [ControlPlane: conditions]                                           | No        |                                                                                                                            |
@@ -100,8 +101,9 @@ The domain for Cluster API resources is `cluster.x-k8s.io`, and control plane pr
 generally use `controlplane.cluster.x-k8s.io` as API group.
 
 If your provider uses a different API group, you MUST grant full read/write RBAC permissions for resources in your API group
-to the Cluster API core controllers. The canonical way to do so is via a `ClusterRole` resource with the [aggregation label]
-`cluster.x-k8s.io/aggregate-to-manager: "true"`.
+to the Cluster API core controllers. If any resource sets another resource as the owner with `blockOwnerDeletion` set,
+additional RBAC to update finalizers on the **owner resource** is required.
+The canonical way to do so is via a `ClusterRole` resource with the [aggregation label] `cluster.x-k8s.io/aggregate-to-manager: "true"`.
 
 The following is an example ClusterRole for a `FooControlPlane` resource in the `controlplane.foo.com` API group:
 
@@ -280,7 +282,7 @@ the implementer should exit reconciliation until it sees Cluster's `spec.control
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 ```go
 type FooControlPlaneSpec struct {
@@ -376,7 +378,7 @@ documentation][scale].
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to v1beta1 replica counters, the Cluster controller with temporarily continue to read
 `status.readyReplicas`,  `status.updatedReplicas` and `status.unavailableReplicas`, even if the semantic of the 
@@ -405,12 +407,39 @@ type FooControlPlaneSpec struct {
 }
 ```
 
-Following fields MUST be implemented in the ControlPlane `status`.
+ControlPlane providers MUST report version information in the ControlPlane `status` by implementing
+at least one of the following fields.
+
+`status.versions` is the preferred source of truth for surfacing control plane versions.
+Entries in this list MUST be ordered from the older to the newer version.
+Each entry MUST include a valid semantic version and if control of the number of replicas is supported
+the number of replicas at that version must be set as well.
+
+```go
+type FooControlPlaneStatus struct {
+    // versions is the aggregated Kubernetes versions in this control plane.
+    // +optional
+    // +listType=map
+    // +listMapKey=version
+    // +kubebuilder:validation:MinItems=1
+    // +kubebuilder:validation:MaxItems=100
+    Versions []clusterv1.StatusVersion `json:"versions,omitempty"`
+
+    // See other rules for more details about mandatory/optional fields in ControlPlane status.
+    // Other fields SHOULD be added based on the needs of your provider.
+}
+```
+
+`status.version` can be used as an alternative or as a fallback mechanism, but support
+for this field will be removed in the next Cluster API contract version.
 
 ```go
 type FooControlPlaneStatus struct {
     // version represents the minimum Kubernetes version for the control plane machines
     // in the cluster.
+    //
+    // Deprecated: This field is deprecated and is going to be removed in a future API version.
+    // Please use status.versions instead.
     // +optional
     // +kubebuilder:validation:MinLength=1
     // +kubebuilder:validation:MaxLength=256
@@ -421,11 +450,11 @@ type FooControlPlaneStatus struct {
 }
 ```
 
-NOTE: To align with API conventions, we recommend since the v1beta2 contract that the `Version` field should be 
+NOTE: To align with API conventions, we recommend since the v1beta2 contract that the `Version` field should be
 of type `string` (it was `*string` before). Both are compatible with the v1beta2 contract though.
-NOTE: The minimum Kubernetes version, and more specifically the API server version, will be used to determine 
-when a control plane is fully upgraded (spec.version == status.version) and for enforcing Kubernetes version skew 
-policies when a Cluster derived from a ClusterClass is managed by the Topology controller.
+NOTE: The minimum Kubernetes version, and more specifically the API server version, will be used to determine
+when a control plane is fully upgraded and for enforcing Kubernetes version skew policies when a Cluster derived
+from a ClusterClass is managed by the Topology controller.
 
 ### ControlPlane: machines
 
@@ -504,7 +533,7 @@ See [In place propagation of changes affecting Kubernetes objects only] as well 
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 For reference. The v1beta1 contract had `nodeDrainTimeout`, `nodeVolumeDetachTimeout`, `nodeDeletionTimeout` fields
 of type `*metav1.Duration` instead of the new fields with `Seconds` suffix of type `*int32`.
@@ -547,6 +576,33 @@ type FooControlPlaneMachineTemplateSpec struct {
 
 NOTE: In the v1beta1 contract the `readinessGates` field was located directly in the `spec.machineTemplate` field.
 
+In case you are developing a control plane provider that allows definition of machine taints, you SHOULD also implement
+the following `spec.machineTemplate.spec` field.
+
+```go
+type FooControlPlaneMachineTemplateSpec struct {
+	// taints are the node taints that Cluster API will manage.
+	// This list is not necessarily complete: other Kubernetes components may add or remove other taints from nodes,
+	// e.g. the node controller might add the node.kubernetes.io/not-ready taint.
+	// Only those taints defined in this list will be added or removed by core Cluster API controllers.
+	//
+	// There can be at most 64 taints.
+	// A pod would have to tolerate all existing taints to run on the corresponding node.
+	//
+	// NOTE: This list is implemented as a "map" type, meaning that individual elements can be managed by different owners.
+	// +optional
+	// +listType=map
+	// +listMapKey=key
+	// +listMapKey=effect
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=64
+	Taints []clusterv1.MachineTaint `json:"taints,omitempty"`
+
+    // See other rules for more details about mandatory/optional fields in ControlPlane spec.
+    // Other fields SHOULD be added based on the needs of your provider.
+}
+```
+
 In case you are developing a control plane provider where control plane instances uses a Cluster API Machine 
 object to represent each control plane instance, but those instances do not show up as a Kubernetes node (for example, 
 managed control plane providers for AKS, EKS, GKE etc), you SHOULD also implement the following `status` field.
@@ -570,6 +626,34 @@ can benefit from several Cluster API behaviours, for example:
 - Machine provisioning workflow (in coordination with an InfraMachine and a BootstrapConfig of your choice)
 - Machine health checking
 - Machine drain and wait for volume detach during deletion
+
+### ControlPlane: rolloutAfter
+
+In case you are developing a control plane provider which supports scheduled rollout via
+the `rolloutAfter` field, following fields MUST be implemented in the ControlPlane `spec`.
+
+```go
+type FooControlPlaneSpec struct {
+    // rollout allows you to configure the behaviour of rolling updates to the control plane.
+    // +optional
+    Rollout FooControlPlaneRolloutSpec `json:"rollout,omitempty,omitzero"`
+	
+    // See other rules for more details about mandatory/optional fields in ControlPlane status.
+    // Other fields SHOULD be added based on the needs of your provider.
+}
+
+// +kubebuilder:validation:MinProperties=1
+type FooControlPlaneRolloutSpec struct {
+    // after is a field to indicate a rollout should be performed
+    // after the specified time even if no changes have been made to the
+    // FooControlPlane.
+    // Example: In the YAML the time can be specified in the RFC3339 format.
+    // To specify the rolloutAfter target as March 9, 2023, at 9 am UTC
+    // use "2023-03-09T09:00:00Z".
+    // +optional
+    After metav1.Time `json:"after,omitempty,omitzero"`
+}
+```
 
 ### ControlPlane: initialization completed
 
@@ -614,7 +698,7 @@ If defined, also ControlPlane's `spec.controlPlaneEndpoint` will be surfaced on 
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to initialization completed:
 
@@ -628,7 +712,7 @@ the ControlPlane resource will be ignored.
 
 ### ControlPlane: in-place updates
 
-In case a control plane provider would like to provide support for in-place updates, please check the [proposal](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/20240807-in-place-updates.md).
+In case a control plane provider would like to provide support for in-place updates, please check the [proposal](https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20240807-in-place-updates.md).
 
 Supporting in-place updates requires:
 - implementing the call for the registered `CanUpdateMachine` hook when performing the "can update in-place" decision.
@@ -691,7 +775,7 @@ See [Improving status in CAPI resources] for more context.
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to conditions:
 
@@ -716,7 +800,7 @@ See [Improving status in CAPI resources] for more context.
 <h1>Compatibility with the deprecated v1beta1 contract</h1>
 
 In order to ease the transition for providers, the v1beta2 version of the Cluster API contract _temporarily_
-preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in August 2026.
+preserves compatibility with the deprecated v1beta1 contract; compatibility will be removed tentatively in April 2027.
 
 With regards to terminal failures:
 
@@ -843,7 +927,7 @@ propagated to Kubernetes Nodes.
 
 <h1>Heads up! this will change with the v1beta2 contract</h1>
 
-When the v1beta2 contract will be released (tentative Apr 2025), Cluster API is going to standardize how
+When the v1beta2 contract will be released (August 2025), Cluster API is going to standardize how
 machines determine if they are available or up to date with the spec of the owner resource.
 
 In order to ensure a nice and consistent user experience across the entire Cluster, also ControlPlane providers
@@ -907,6 +991,7 @@ is implemented in ControlPlane controllers:
 [ControlPlane: replicas]: #controlplane-replicas 
 [scale]: https://kubernetes.io/docs/tasks/extend-kubernetes/custom-resources/custom-resource-definitions/#subresources
 [ControlPlane: machines]: #controlplane-machines
+[ControlPlane: rolloutAfter]: #controlplane-rolloutafter
 [In place propagation of changes affecting Kubernetes objects only]: https://github.com/kubernetes-sigs/cluster-api/blob/main/docs/proposals/20221003-In-place-propagation-of-Kubernetes-objects-only-changes.md
 [ControlPlane: version]: #controlplane-version 
 [ControlPlane: initialization completed]: #controlplane-initialization-completed
@@ -929,4 +1014,4 @@ is implemented in ControlPlane controllers:
 [Clusterctl support]: #clusterctl-support
 [ControlPlane: pausing]: #controlplane-pausing
 [implementation best practices]: ../best-practices.md
-[Cluster API v1.11 migration notes]: ../migrations/v1.10-to-v1.11.md
+[Cluster API v1.11 migration notes]: https://release-1-11.cluster-api.sigs.k8s.io/developer/providers/migrations/v1.10-to-v1.11
